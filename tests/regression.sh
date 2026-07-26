@@ -27,6 +27,16 @@ extracted="$(download_core "${1:-1.13.14}")"
 install -m 0755 "$extracted" "$SINGBOX_BIN"
 rm -rf "$(dirname "$(dirname "$extracted")")"
 
+for rule_name in geosite-cn geoip-cn; do
+  case "$rule_name" in
+    geosite-cn) rule_url="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs" ;;
+    geoip-cn) rule_url="https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs" ;;
+  esac
+  curl --proto '=https' --tlsv1.2 -fsSL "$rule_url" -o "$TEST_ROOT/${rule_name}.srs"
+  "$SINGBOX_BIN" rule-set decompile "$TEST_ROOT/${rule_name}.srs" -o "$TEST_ROOT/${rule_name}.json"
+  jq -e '(.version >= 1) and (.rules|length > 0)' "$TEST_ROOT/${rule_name}.json" >/dev/null
+done
+
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
   -subj '/CN=proxy.example.com' \
   -keyout "$TEST_ROOT/key.pem" -out "$TEST_ROOT/fullchain.pem" >/dev/null 2>&1
@@ -73,7 +83,7 @@ jq -n \
         tls_domain:"proxy.example.com",certificate_path:$cert,key_path:$key
       }
     ],
-    argo:{enabled:true,mode:"named",node_id:"vmess-test",hostname:"backup.example.com",origin_port:23456}
+    argo:{enabled:true,mode:"named",node_id:"vmess-test",hostname:"backup.example.com",origin_port:23456,provisioned:true,verified:true,tunnel_id:"6e001ae0-26fb-407a-9540-80d5df60e54d"}
   }' > "$STATE_FILE"
 chmod 0600 "$STATE_FILE"
 
@@ -94,6 +104,12 @@ if grep -R -F -- "$private_key" "$CLIENT_DIR" "$LINK_DIR" "$QR_DIR" >/dev/null; 
   exit 1
 fi
 jq -e '.inbounds|length == 6' "$SERVER_CONFIG" >/dev/null
+jq -e '[.inbounds[] | select(.type=="vless" or .type=="anytls" or (.type=="vmess" and .listen=="::")) | .tcp_fast_open] | all' "$SERVER_CONFIG" >/dev/null
 jq -e '.outbounds|map(.tag)|index("proxy") != null' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
+jq -e '.route.rules[0].action=="sniff" and .route.rules[1].action=="hijack-dns"' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
+jq -e '.route.rule_set|map(.tag)|sort == ["geoip-cn","geosite-cn"]' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
+jq -e '.dns.servers|map(.tag)|sort == ["dns-direct","dns-remote"]' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
+jq -e '.experimental.cache_file.enabled==true and .inbounds[0].strict_route==true' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
+jq -e '[.. | objects | keys[]] | any(.=="geoip" or .=="geosite" or .=="inet4_address" or .=="address_resolver" or .=="dns_mode") | not' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
 
-printf 'Regression passed: server + %d desktop configs, 6 links.\n' "$checked"
+printf 'Regression passed: server + %d desktop configs, modern DNS/route rules, 6 links.\n' "$checked"

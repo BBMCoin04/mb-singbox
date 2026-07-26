@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 MANAGER_REPO="${MB_SINGBOX_REPO:-BBMCoin04/mb-singbox}"
@@ -67,6 +67,12 @@ confirm() {
   local prompt="$1" answer
   read -r -p "${prompt} [y/N]: " answer
   [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+confirm_default_yes() {
+  local prompt="$1" answer
+  read -r -p "${prompt} [Y/n]: " answer
+  [[ ! "$answer" =~ ^[Nn]$ ]]
 }
 
 require_root() {
@@ -180,6 +186,13 @@ init_state() {
       error "状态文件格式不正确：${STATE_FILE}"
       return 1
     }
+    local normalized
+    normalized="$(mktemp "${ROOT_DIR}/.state-normalize.XXXXXX.json")" || return 1
+    jq '.argo.provisioned //= false | .argo.verified //= false | .argo.tunnel_id //= ""' "$STATE_FILE" > "$normalized"
+    if ! cmp -s "$STATE_FILE" "$normalized"; then
+      install -m 0600 "$normalized" "$STATE_FILE"
+    fi
+    rm -f "$normalized"
     return 0
   fi
   jq -n --arg now "$(date -u +%FT%TZ)" '{
@@ -193,7 +206,10 @@ init_state() {
       mode: "",
       node_id: "",
       hostname: "",
-      origin_port: 0
+      origin_port: 0,
+      provisioned: false,
+      verified: false,
+      tunnel_id: ""
     }
   }' > "$STATE_FILE"
   chmod 0600 "$STATE_FILE"
@@ -328,6 +344,17 @@ Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
 NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -396,6 +423,7 @@ render_server_config() {
   jq 'def inbound:
     if .type == "reality" then {
       type: "vless", tag: ("in-" + .id), listen: "::", listen_port: .port,
+      reuse_addr: true, tcp_fast_open: true,
       users: [{name: .name, uuid: .uuid, flow: "xtls-rprx-vision"}],
       tls: {
         enabled: true, server_name: .server_name,
@@ -410,23 +438,27 @@ render_server_config() {
     }
     elif .type == "hysteria2" then {
       type: "hysteria2", tag: ("in-" + .id), listen: "::", listen_port: .port,
+      reuse_addr: true,
       users: [{name: .name, password: .password}],
       obfs: {type: "salamander", password: .obfs_password},
       tls: {enabled: true, certificate_path: .certificate_path, key_path: .key_path}
     }
     elif .type == "tuic" then {
       type: "tuic", tag: ("in-" + .id), listen: "::", listen_port: .port,
+      reuse_addr: true,
       users: [{name: .name, uuid: .uuid, password: .password}],
       congestion_control: "bbr", zero_rtt_handshake: false, heartbeat: "10s",
       tls: {enabled: true, certificate_path: .certificate_path, key_path: .key_path}
     }
     elif .type == "anytls" then {
       type: "anytls", tag: ("in-" + .id), listen: "::", listen_port: .port,
+      reuse_addr: true, tcp_fast_open: true,
       users: [{name: .name, password: .password}],
       tls: {enabled: true, certificate_path: .certificate_path, key_path: .key_path}
     }
     elif .type == "vmess" then {
       type: "vmess", tag: ("in-" + .id), listen: "::", listen_port: .port,
+      reuse_addr: true, tcp_fast_open: true,
       users: [{name: .name, uuid: .uuid, alterId: 0}],
       tls: {enabled: true, certificate_path: .certificate_path, key_path: .key_path},
       transport: {type: "ws", path: .path}
@@ -456,12 +488,14 @@ make_outbound_json() {
   jq -n --argjson n "$node_json" --arg server "$server_address" --arg argo "$argo_hostname" '
     if $argo != "" then {
       type: "vmess", tag: ("node-" + $n.id + "-argo"), server: $argo, server_port: 443,
+      connect_timeout: "10s", tcp_fast_open: true,
       uuid: $n.uuid, security: "auto", alter_id: 0, network: "tcp",
       tls: {enabled: true, server_name: $argo},
       transport: {type: "ws", path: $n.path, headers: {Host: $argo}}
     }
     elif $n.type == "reality" then {
       type: "vless", tag: ("node-" + $n.id), server: $server, server_port: $n.port,
+      connect_timeout: "10s", tcp_fast_open: true,
       uuid: $n.uuid, flow: "xtls-rprx-vision", network: "tcp",
       tls: {
         enabled: true, server_name: $n.server_name,
@@ -471,23 +505,27 @@ make_outbound_json() {
     }
     elif $n.type == "hysteria2" then {
       type: "hysteria2", tag: ("node-" + $n.id), server: $server, server_port: $n.port,
+      connect_timeout: "10s",
       password: $n.password,
       obfs: {type: "salamander", password: $n.obfs_password},
       tls: {enabled: true, server_name: $n.tls_domain}
     }
     elif $n.type == "tuic" then {
       type: "tuic", tag: ("node-" + $n.id), server: $server, server_port: $n.port,
+      connect_timeout: "10s",
       uuid: $n.uuid, password: $n.password,
       congestion_control: "bbr", udp_relay_mode: "native", zero_rtt_handshake: false,
       tls: {enabled: true, server_name: $n.tls_domain}
     }
     elif $n.type == "anytls" then {
       type: "anytls", tag: ("node-" + $n.id), server: $server, server_port: $n.port,
+      connect_timeout: "10s",
       password: $n.password,
       tls: {enabled: true, server_name: $n.tls_domain}
     }
     elif $n.type == "vmess" then {
       type: "vmess", tag: ("node-" + $n.id), server: $server, server_port: $n.port,
+      connect_timeout: "10s", tcp_fast_open: true,
       uuid: $n.uuid, security: "auto", alter_id: 0, network: "tcp",
       tls: {enabled: true, server_name: $n.tls_domain},
       transport: {type: "ws", path: $n.path, headers: {Host: $n.tls_domain}}
@@ -505,12 +543,21 @@ render_client_config() {
       log: {level: "info", timestamp: true},
       dns: {
         servers: [
-          {type: "local", tag: "dns-local"},
+          {
+            type: "https", tag: "dns-direct", server: "223.5.5.5", server_port: 443,
+            path: "/dns-query", tls: {enabled: true, server_name: "dns.alidns.com"}
+          },
           {
             type: "https", tag: "dns-remote", server: "1.1.1.1", server_port: 443,
             path: "/dns-query", tls: {enabled: true, server_name: "cloudflare-dns.com"},
             detour: "proxy"
           }
+        ],
+        rules: [
+          {clash_mode: "direct", action: "route", server: "dns-direct"},
+          {clash_mode: "global", action: "route", server: "dns-remote"},
+          {domain_suffix: [".lan", ".local", ".localhost", ".localdomain"], action: "route", server: "dns-direct"},
+          {rule_set: "geosite-cn", action: "route", server: "dns-direct"}
         ],
         final: "dns-remote",
         strategy: "prefer_ipv4"
@@ -539,14 +586,32 @@ render_client_config() {
       ]),
       route: {
         rules: [
+          {action: "sniff"},
           {protocol: "dns", action: "hijack-dns"},
-          {ip_is_private: true, action: "route", outbound: "direct"}
+          {clash_mode: "direct", action: "route", outbound: "direct"},
+          {clash_mode: "global", action: "route", outbound: "proxy"},
+          {ip_is_private: true, action: "route", outbound: "direct"},
+          {domain_suffix: [".lan", ".local", ".localhost", ".localdomain"], action: "route", outbound: "direct"},
+          {rule_set: ["geosite-cn", "geoip-cn"], action: "route", outbound: "direct"}
+        ],
+        rule_set: [
+          {
+            type: "remote", tag: "geosite-cn", format: "binary",
+            url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+            download_detour: "proxy", update_interval: "1d"
+          },
+          {
+            type: "remote", tag: "geoip-cn", format: "binary",
+            url: "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+            download_detour: "proxy", update_interval: "1d"
+          }
         ],
         final: "proxy",
         auto_detect_interface: true,
-        default_domain_resolver: "dns-local"
+        default_domain_resolver: "dns-direct"
       },
       experimental: {
+        cache_file: {enabled: true, path: "cache.db"},
         clash_api: {external_controller: "127.0.0.1:9090", default_mode: "rule"}
       }
     }' > "$output"
@@ -658,6 +723,15 @@ generate_outputs() {
     render_client_config "$temp_root/all-outbounds.json" system-proxy "$temp_root/clients/windows-all-system-proxy.json" || { rm -rf "$temp_root"; return 1; }
   fi
   rm -f "$temp_root"/*-outbounds.json "$temp_root/all-outbounds.json"
+
+  local client_config
+  while IFS= read -r client_config; do
+    if ! "$SINGBOX_BIN" check -c "$client_config" >/dev/null; then
+      error "桌面端候选配置未通过 Sing-box 检查：$(basename "$client_config")"
+      rm -rf "$temp_root"
+      return 1
+    fi
+  done < <(find "$temp_root/clients" -type f -name '*.json' -print)
 
   rm -rf "${CLIENT_DIR}.old" "${LINK_DIR}.old" "${QR_DIR}.old"
   [[ -d "$CLIENT_DIR" ]] && mv "$CLIENT_DIR" "${CLIENT_DIR}.old"
@@ -965,23 +1039,32 @@ add_node_menu() {
 }
 
 show_node_result() {
-  local id="$1" node name type port link_file
+  local id="$1" node name type port link_file argo_link_file
   node="$(jq -c --arg id "$id" '.nodes[] | select(.id == $id)' "$STATE_FILE")"
   [[ -n "$node" ]] || return 1
   name="$(jq -r '.name' <<<"$node")"
   type="$(jq -r '.type' <<<"$node")"
   port="$(jq -r '.port' <<<"$node")"
   link_file="${LINK_DIR}/${id}.txt"
-  printf '\n%s节点已创建%s\n' "$C_BOLD" "$C_RESET"
+  argo_link_file="${LINK_DIR}/${id}-argo.txt"
+  printf '\n%s节点详情%s\n' "$C_BOLD" "$C_RESET"
   printf '名称：%s\n协议：%s\n端口：%s\n' "$name" "$type" "$port"
   printf 'Windows TUN：%s/%s-windows-tun.json\n' "$CLIENT_DIR" "$id"
   printf 'Windows 系统代理：%s/%s-windows-system-proxy.json\n' "$CLIENT_DIR" "$id"
   if [[ -s "$link_file" ]]; then
-    printf '\n分享链接：\n'
+    printf '\n直连分享链接：\n'
     cat "$link_file"
     if command -v qrencode >/dev/null 2>&1 && [[ -t 1 ]]; then
       printf '\n'
       qrencode -t ANSIUTF8 -m 1 "$(cat "$link_file")" || true
+    fi
+  fi
+  if [[ -s "$argo_link_file" ]]; then
+    printf '\nArgo 应急分享链接：\n'
+    cat "$argo_link_file"
+    if command -v qrencode >/dev/null 2>&1 && [[ -t 1 ]]; then
+      printf '\n'
+      qrencode -t ANSIUTF8 -m 1 "$(cat "$argo_link_file")" || true
     fi
   fi
 }
@@ -993,27 +1076,40 @@ list_nodes() {
     printf '尚未创建节点。\n'
     return 0
   fi
-  jq -r '.nodes[] | [.id, .name, .type, (.port|tostring), (if (.type=="hysteria2" or .type=="tuic") then "UDP" else "TCP" end)] | @tsv' "$STATE_FILE" | \
-    awk -F '\t' '{printf "%-30s  %-18s  %-10s  %5s/%s\n", $1, $2, $3, $4, $5}'
+  jq -r '.nodes | to_entries[] | [(.key+1|tostring), .value.name, .value.type, (.value.port|tostring), (if (.value.type=="hysteria2" or .value.type=="tuic") then "UDP" else "TCP" end), .value.id] | @tsv' "$STATE_FILE" | \
+    awk -F '\t' '{printf "%2s. %-18s  %-10s  %5s/%-3s  ID=%s\n", $1, $2, $3, $4, $5, $6}'
   printf '\n桌面端汇总配置：\n  %s/windows-all-tun.json\n  %s/windows-all-system-proxy.json\n' "$CLIENT_DIR" "$CLIENT_DIR"
   printf '全部分享链接：%s/all.txt\n' "$LINK_DIR"
   if jq -e '.argo.enabled' "$STATE_FILE" >/dev/null; then
-    printf 'Argo：%s，%s\n' "$(jq -r '.mode' "$STATE_FILE")" "$(jq -r '.hostname // "等待域名"' "$STATE_FILE")"
+    printf 'Argo：%s，%s，%s\n' \
+      "$(jq -r '.argo.mode // "未知模式"' "$STATE_FILE")" \
+      "$(jq -r '.argo.hostname // "等待域名"' "$STATE_FILE")" \
+      "$(jq -r 'if (.argo.verified // false) then "已验证" else "待验证" end' "$STATE_FILE")"
   fi
 }
 
-view_node_menu() {
-  local id
-  list_nodes
-  [[ "$(jq '.nodes|length' "$STATE_FILE")" -gt 0 ]] || return 0
-  read -r -p "输入节点 ID 查看详情（留空返回）：" id
-  [[ -n "$id" ]] || return 0
-  if jq -e --arg id "$id" 'any(.nodes[]; .id == $id)' "$STATE_FILE" >/dev/null; then
-    show_node_result "$id"
-  else
-    error "节点不存在：${id}"
+select_node_id() {
+  local prompt="$1" choice count
+  count="$(jq '.nodes|length' "$STATE_FILE")"
+  (( count > 0 )) || return 1
+  read -r -p "${prompt}（输入 0 返回）：" choice
+  [[ "$choice" == "0" ]] && return 2
+  if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > count )); then
+    error "请选择 1 到 ${count}，或输入 0 返回。"
     return 1
   fi
+  jq -r --argjson index "$((choice - 1))" '.nodes[$index].id' "$STATE_FILE"
+}
+
+view_node_menu() {
+  local id rc
+  list_nodes
+  [[ "$(jq '.nodes|length' "$STATE_FILE")" -gt 0 ]] || return 0
+  id="$(select_node_id "选择要查看的节点编号")"
+  rc=$?
+  (( rc == 2 )) && return 0
+  (( rc == 0 )) || return "$rc"
+  show_node_result "$id"
 }
 
 choose_port_for_node() {
@@ -1060,16 +1156,18 @@ apply_node_field_update() {
 }
 
 edit_node() {
-  local id node type network choice value port
+  local id node type network choice value port rc
   require_root
   require_core || return 1
   init_state || return 1
   acquire_lock || return 1
   list_nodes
   [[ "$(jq '.nodes|length' "$STATE_FILE")" -gt 0 ]] || return 0
-  read -r -p "输入要修改的节点 ID：" id
+  id="$(select_node_id "选择要修改的节点编号")"
+  rc=$?
+  (( rc == 2 )) && return 0
+  (( rc == 0 )) || return "$rc"
   node="$(jq -c --arg id "$id" '.nodes[] | select(.id==$id)' "$STATE_FILE")"
-  [[ -n "$node" ]] || { error "节点不存在：${id}"; return 1; }
   type="$(jq -r '.type' <<<"$node")"
   case "$type" in hysteria2|tuic) network=udp ;; *) network=tcp ;; esac
 
@@ -1143,16 +1241,16 @@ edit_node() {
 }
 
 delete_node() {
-  local id candidate argo_bound=0
+  local id candidate argo_bound=0 rc
   require_root
   init_state || return 1
   acquire_lock || return 1
   list_nodes
-  read -r -p "输入要删除的节点 ID：" id
-  jq -e --arg id "$id" 'any(.nodes[]; .id == $id)' "$STATE_FILE" >/dev/null || {
-    error "节点不存在：${id}"
-    return 1
-  }
+  [[ "$(jq '.nodes|length' "$STATE_FILE")" -gt 0 ]] || return 0
+  id="$(select_node_id "选择要删除的节点编号")"
+  rc=$?
+  (( rc == 2 )) && return 0
+  (( rc == 0 )) || return "$rc"
   jq -e --arg id "$id" '.argo.enabled and .argo.node_id == $id' "$STATE_FILE" >/dev/null && argo_bound=1
   warn "将删除节点 ${id} 的服务端配置、桌面配置、链接和二维码。"
   (( argo_bound )) && warn "该节点绑定了 Argo，Argo 本地服务也会停止；不会删除 Cloudflare 远程 Tunnel。"
@@ -1161,7 +1259,7 @@ delete_node() {
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
   jq --arg id "$id" '
     .nodes |= map(select(.id != $id)) |
-    if .argo.node_id == $id then .argo = {enabled:false,mode:"",node_id:"",hostname:"",origin_port:0} else . end
+    if .argo.node_id == $id then .argo = {enabled:false,mode:"",node_id:"",hostname:"",origin_port:0,provisioned:false,verified:false,tunnel_id:""} else . end
   ' "$STATE_FILE" > "$candidate"
   if apply_candidate_state "$candidate"; then
     rm -f "$candidate"
@@ -1254,6 +1352,14 @@ ExecStart=${CLOUDFLARED_BIN} tunnel --no-autoupdate run --token-file ${ARGO_TOKE
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
@@ -1271,6 +1377,14 @@ ExecStart=${CLOUDFLARED_BIN} tunnel --no-autoupdate --url http://127.0.0.1:${ori
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
@@ -1296,9 +1410,179 @@ wait_quick_hostname() {
   return 1
 }
 
+decode_tunnel_token() {
+  local token="$1" normalized padding
+  normalized="${token//-/+}"
+  normalized="${normalized//_/\/}"
+  padding=$(( (4 - ${#normalized} % 4) % 4 ))
+  while (( padding-- > 0 )); do normalized+="="; done
+  printf '%s' "$normalized" | base64 -d 2>/dev/null | jq -ce '
+    select((.a|type)=="string" and (.t|type)=="string" and (.s|type)=="string") |
+    {account_id:.a,tunnel_id:.t}
+  '
+}
+
+CF_API_TOKEN=""
+cloudflare_api_request() {
+  local method="$1" url="$2" data_file="$3" response_file="$4" curl_options rc
+  curl_options="$(printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$CF_API_TOKEN")"
+  if [[ -n "$data_file" ]]; then
+    printf '%s' "$curl_options" | curl --config - --proto '=https' --tlsv1.2 --retry 2 --retry-delay 1 -sS \
+      -X "$method" --data-binary "@${data_file}" -o "$response_file" -w '%{http_code}' "$url" > "${response_file}.status"
+  else
+    printf '%s' "$curl_options" | curl --config - --proto '=https' --tlsv1.2 --retry 2 --retry-delay 1 -sS \
+      -X "$method" -o "$response_file" -w '%{http_code}' "$url" > "${response_file}.status"
+  fi
+  rc="${PIPESTATUS[1]}"
+  unset curl_options
+  (( rc == 0 )) || return "$rc"
+  [[ "$(cat "${response_file}.status")" =~ ^2[0-9][0-9]$ ]] && jq -e '.success == true' "$response_file" >/dev/null 2>&1
+}
+
+cloudflare_error_text() {
+  jq -r '[.errors[]?.message, .messages[]?.message] | map(select(. != null and . != "")) | join("；") | if .=="" then "Cloudflare API 请求失败" else . end' "$1" 2>/dev/null || printf 'Cloudflare API 请求失败'
+}
+
+provision_named_tunnel() {
+  local hostname="$1" origin_port="$2" tunnel_token="$3" token_meta account_id tunnel_id zone_id temp_dir current_config config_payload config_response dns_response dns_payload dns_write_response record_count record_id record_type api_token
+  confirm_default_yes "是否由脚本自动配置 Public Hostname、Tunnel ingress 和 DNS？" || return 2
+  token_meta="$(decode_tunnel_token "$tunnel_token")" || {
+    error "无法从 Tunnel Token 读取 Account ID 和 Tunnel ID。"
+    return 1
+  }
+  account_id="$(jq -r '.account_id' <<<"$token_meta")"
+  tunnel_id="$(jq -r '.tunnel_id' <<<"$token_meta")"
+  [[ "$account_id" =~ ^[A-Za-z0-9_-]{16,64}$ && "$tunnel_id" =~ ^[0-9a-fA-F-]{36}$ ]] || {
+    error "Tunnel Token 中的账户或 Tunnel 标识格式不正确。"
+    return 1
+  }
+
+  printf '\n自动配置需要最小权限 Cloudflare API Token：\n'
+  printf '  Account -> Cloudflare Tunnel -> Edit\n'
+  printf '  Zone    -> DNS -> Edit\n'
+  read -r -s -p "Cloudflare API Token（仅本次使用，输入不可见）：" api_token
+  printf '\n'
+  [[ -n "$api_token" ]] || { error "API Token 不能为空。"; return 1; }
+  read -r -p "DNS Zone ID：" zone_id
+  [[ "$zone_id" =~ ^[0-9a-fA-F]{32}$ ]] || { error "Zone ID 应为 32 位十六进制字符串。"; return 1; }
+  CF_API_TOKEN="$api_token"
+  unset api_token
+
+  temp_dir="$(mktemp -d "${ROOT_DIR}/.cf-api.XXXXXX")" || { CF_API_TOKEN=""; return 1; }
+  current_config="$temp_dir/current-config.json"
+  config_payload="$temp_dir/config-payload.json"
+  config_response="$temp_dir/config-response.json"
+  dns_response="$temp_dir/dns-response.json"
+  dns_payload="$temp_dir/dns-payload.json"
+  dns_write_response="$temp_dir/dns-write-response.json"
+
+  info "正在读取并合并 Tunnel 现有 ingress，其他主机名不会被覆盖..."
+  if ! cloudflare_api_request GET "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations" "" "$current_config"; then
+    error "读取 Tunnel 配置失败：$(cloudflare_error_text "$current_config")"
+    rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
+  fi
+  jq --arg hostname "$hostname" --arg service "http://127.0.0.1:${origin_port}" '
+    (.result.config // {}) as $config |
+    ($config.ingress // []) as $ingress |
+    (($ingress | map(select((.hostname // "") == "" and (.service // "" | startswith("http_status:")))) | first) // {service:"http_status:404"}) as $catchall |
+    ($config | .ingress = (([$ingress[] | select((.hostname // "") != $hostname and (.hostname // "") != "")] + [{hostname:$hostname,service:$service},$catchall]))) |
+    {config:.}
+  ' "$current_config" > "$config_payload"
+  if ! cloudflare_api_request PUT "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations" "$config_payload" "$config_response"; then
+    error "更新 Tunnel ingress 失败：$(cloudflare_error_text "$config_response")"
+    rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
+  fi
+
+  info "正在创建或更新 ${hostname} 的 Tunnel DNS 记录..."
+  if ! cloudflare_api_request GET "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=$(urlencode "$hostname")&per_page=100" "" "$dns_response"; then
+    error "读取 DNS 记录失败：$(cloudflare_error_text "$dns_response")"
+    rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
+  fi
+  record_count="$(jq '.result|length' "$dns_response")"
+  jq -n --arg name "$hostname" --arg content "${tunnel_id}.cfargotunnel.com" '{type:"CNAME",name:$name,content:$content,proxied:true,ttl:1}' > "$dns_payload"
+  if (( record_count == 0 )); then
+    if ! cloudflare_api_request POST "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" "$dns_payload" "$dns_write_response"; then
+      error "创建 DNS 记录失败：$(cloudflare_error_text "$dns_write_response")"
+      rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
+    fi
+  else
+    record_id="$(jq -r '.result[0].id' "$dns_response")"
+    record_type="$(jq -r '.result[0].type' "$dns_response")"
+    if [[ "$record_type" != "CNAME" ]]; then
+      error "${hostname} 已存在 ${record_type} 记录，脚本不会破坏性转换记录类型。"
+      rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
+    fi
+    if ! cloudflare_api_request PUT "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" "$dns_payload" "$dns_write_response"; then
+      error "更新 DNS 记录失败：$(cloudflare_error_text "$dns_write_response")"
+      rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
+    fi
+  fi
+
+  rm -rf "$temp_dir"
+  CF_API_TOKEN=""
+  ARGO_TUNNEL_ID="$tunnel_id"
+  ok "Cloudflare Public Hostname、ingress 和 DNS 已自动配置。"
+}
+
+verify_argo_endpoint() {
+  local hostname="$1" path="$2" headers status
+  headers="$(mktemp /tmp/mb-argo-verify.XXXXXX)" || return 1
+  for _ in {1..12}; do
+    : > "$headers"
+    curl --proto '=https' --tlsv1.2 --http1.1 -sS --connect-timeout 5 --max-time 5 \
+      -D "$headers" -o /dev/null \
+      -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+      -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+      "https://${hostname}${path}" >/dev/null 2>&1 || true
+    if grep -qE '^HTTP/[0-9.]+ 101([[:space:]]|$)' "$headers"; then
+      rm -f "$headers"
+      return 0
+    fi
+    sleep 3
+  done
+  status="$(awk '/^HTTP\// {code=$2} END {print code}' "$headers")"
+  rm -f "$headers"
+  if [[ -n "$status" ]]; then
+    warn "Argo WebSocket 验证未通过，最后 HTTP 状态：${status}"
+  else
+    warn "Argo WebSocket 验证未收到 HTTP 响应。"
+  fi
+  return 1
+}
+
+set_argo_status() {
+  local provisioned="$1" verified="$2" tunnel_id="${3:-}" candidate
+  candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
+  jq --argjson provisioned "$provisioned" --argjson verified "$verified" --arg tunnel_id "$tunnel_id" '
+    .argo.provisioned=$provisioned | .argo.verified=$verified |
+    if $tunnel_id != "" then .argo.tunnel_id=$tunnel_id else . end
+  ' "$STATE_FILE" > "$candidate"
+  install -m 0600 "$candidate" "$STATE_FILE"
+  rm -f "$candidate"
+  generate_outputs "$STATE_FILE"
+}
+
+verify_current_argo() {
+  local hostname node_id path
+  jq -e '.argo.enabled and (.argo.hostname // "") != ""' "$STATE_FILE" >/dev/null || { error "当前 Argo 没有可验证的公网域名。"; return 1; }
+  hostname="$(jq -r '.argo.hostname' "$STATE_FILE")"
+  node_id="$(jq -r '.argo.node_id' "$STATE_FILE")"
+  path="$(jq -r --arg id "$node_id" '.nodes[] | select(.id==$id) | .path' "$STATE_FILE")"
+  info "正在验证 wss://${hostname}${path}..."
+  if verify_argo_endpoint "$hostname" "$path"; then
+    set_argo_status true true "$(jq -r '.argo.tunnel_id // ""' "$STATE_FILE")"
+    ok "Argo 公网 WebSocket 已验证可用。"
+  else
+    set_argo_status "$(jq -r '.argo.provisioned // false' "$STATE_FILE")" false "$(jq -r '.argo.tunnel_id // ""' "$STATE_FILE")"
+    return 1
+  fi
+}
+
+ARGO_TUNNEL_ID=""
 configure_argo() {
   local -a vmess_ids=()
-  local line index choice id mode hostname token origin candidate rollback
+  local line index choice id mode hostname token origin candidate rollback path provision_rc tunnel_id=""
+  local provisioned=false verified=false
   require_root
   require_core || return 1
   init_state || return 1
@@ -1343,7 +1627,7 @@ configure_argo() {
   esac
   origin="$(random_local_port)" || { error "无法分配 Argo 本地端口。"; return 1; }
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  jq --arg mode "$mode" --arg id "$id" --arg hostname "$hostname" --argjson origin "$origin" '.argo={enabled:true,mode:$mode,node_id:$id,hostname:$hostname,origin_port:$origin}' "$STATE_FILE" > "$candidate"
+  jq --arg mode "$mode" --arg id "$id" --arg hostname "$hostname" --argjson origin "$origin" '.argo={enabled:true,mode:$mode,node_id:$id,hostname:$hostname,origin_port:$origin,provisioned:false,verified:false,tunnel_id:""}' "$STATE_FILE" > "$candidate"
   if ! apply_candidate_state "$candidate"; then
     rm -f "$candidate" "$ARGO_TOKEN_FILE"
     return 1
@@ -1354,25 +1638,47 @@ configure_argo() {
     error "Argo 服务启动失败，正在撤销本地 Argo 配置。"
     stop_argo_service
     rollback="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-    jq '.argo={enabled:false,mode:"",node_id:"",hostname:"",origin_port:0}' "$STATE_FILE" > "$rollback"
+    jq '.argo={enabled:false,mode:"",node_id:"",hostname:"",origin_port:0,provisioned:false,verified:false,tunnel_id:""}' "$STATE_FILE" > "$rollback"
     apply_candidate_state "$rollback" || true
     rm -f "$rollback"
     return 1
   fi
+  path="$(jq -r --arg id "$id" '.nodes[] | select(.id==$id) | .path' "$STATE_FILE")"
   if [[ "$mode" == "quick" ]]; then
     hostname="$(wait_quick_hostname)" || {
       warn "Quick Tunnel 已启动，但暂未从日志取得随机域名。稍后可在 Argo 菜单刷新。"
       return 0
     }
     candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-    jq --arg hostname "$hostname" '.argo.hostname=$hostname' "$STATE_FILE" > "$candidate"
+    jq --arg hostname "$hostname" '.argo.hostname=$hostname | .argo.provisioned=true' "$STATE_FILE" > "$candidate"
     install -m 0600 "$candidate" "$STATE_FILE"
     rm -f "$candidate"
-    generate_outputs "$STATE_FILE"
+    provisioned=true
   else
-    printf '\n请在 Cloudflare Zero Trust 中确认 Public Hostname 的服务指向：\n  http://127.0.0.1:%s\n' "$origin"
+    ARGO_TUNNEL_ID=""
+    provision_named_tunnel "$hostname" "$origin" "$token"
+    provision_rc=$?
+    if (( provision_rc == 0 )); then
+      provisioned=true
+      tunnel_id="$ARGO_TUNNEL_ID"
+    else
+      printf '\n自动配置未完成。手动配置时 Public Hostname 必须指向：\n  http://127.0.0.1:%s\n' "$origin"
+    fi
   fi
-  ok "Argo 已启用：${hostname:-等待 Quick Tunnel 域名}"
+  unset token
+
+  if [[ "$provisioned" == "true" ]]; then
+    info "正在验证 wss://${hostname}${path}，首次 DNS 生效可能需要几十秒..."
+    if verify_argo_endpoint "$hostname" "$path"; then
+      verified=true
+    fi
+  fi
+  set_argo_status "$provisioned" "$verified" "$tunnel_id"
+  if [[ "$verified" == "true" ]]; then
+    ok "Argo 已自动配置并验证可用：${hostname}"
+  else
+    warn "Argo 本地连接器已运行，但公网 WebSocket 尚未验证；不会把它标记为完成。"
+  fi
 }
 
 refresh_quick_argo() {
@@ -1380,11 +1686,12 @@ refresh_quick_argo() {
   jq -e '.argo.enabled and .argo.mode=="quick"' "$STATE_FILE" >/dev/null || { error "当前未启用 Quick Tunnel。"; return 1; }
   hostname="$(wait_quick_hostname)" || { error "仍未从 cloudflared 日志取得随机域名。"; return 1; }
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  jq --arg hostname "$hostname" '.argo.hostname=$hostname' "$STATE_FILE" > "$candidate"
+  jq --arg hostname "$hostname" '.argo.hostname=$hostname | .argo.provisioned=true | .argo.verified=false' "$STATE_FILE" > "$candidate"
   install -m 0600 "$candidate" "$STATE_FILE"
   rm -f "$candidate"
   generate_outputs "$STATE_FILE"
-  ok "Quick Tunnel 域名已更新：${hostname}"
+  info "Quick Tunnel 域名已更新：${hostname}"
+  verify_current_argo
 }
 
 disable_argo() {
@@ -1395,7 +1702,7 @@ disable_argo() {
   confirm "确定停用 Argo？" || return 0
   stop_argo_service
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  jq '.argo={enabled:false,mode:"",node_id:"",hostname:"",origin_port:0}' "$STATE_FILE" > "$candidate"
+  jq '.argo={enabled:false,mode:"",node_id:"",hostname:"",origin_port:0,provisioned:false,verified:false,tunnel_id:""}' "$STATE_FILE" > "$candidate"
   if apply_candidate_state "$candidate"; then
     rm -f "$candidate"
     ok "Argo 已停用。"
@@ -1410,17 +1717,20 @@ argo_menu() {
   init_state || return 1
   printf '\nArgo（仅 VMess-WebSocket）：\n'
   if jq -e '.argo.enabled' "$STATE_FILE" >/dev/null; then
-    printf '状态：已启用，模式=%s，域名=%s，源站=127.0.0.1:%s\n' "$(jq -r '.argo.mode' "$STATE_FILE")" "$(jq -r '.argo.hostname // "等待中"' "$STATE_FILE")" "$(jq -r '.argo.origin_port' "$STATE_FILE")"
+    printf '状态：已启用，模式=%s，域名=%s，源站=127.0.0.1:%s，公网=%s\n' \
+      "$(jq -r '.argo.mode' "$STATE_FILE")" "$(jq -r '.argo.hostname // "等待中"' "$STATE_FILE")" \
+      "$(jq -r '.argo.origin_port' "$STATE_FILE")" "$(jq -r 'if (.argo.verified // false) then "已验证" else "待验证" end' "$STATE_FILE")"
   else
     printf '状态：未启用\n'
   fi
-  printf '  1. 配置 Argo\n  2. 刷新 Quick Tunnel 域名\n  3. 停用 Argo\n  4. 查看 cloudflared 日志\n  0. 返回\n'
+  printf '  1. 配置 Argo\n  2. 刷新 Quick Tunnel 域名\n  3. 验证 Argo 公网 WebSocket\n  4. 停用 Argo\n  5. 查看 cloudflared 日志\n  0. 返回\n'
   read -r -p "请选择：" choice
   case "$choice" in
     1) configure_argo ;;
     2) refresh_quick_argo ;;
-    3) disable_argo ;;
-    4) journalctl -u "$ARGO_SERVICE_NAME" -n 100 --no-pager ;;
+    3) verify_current_argo ;;
+    4) disable_argo ;;
+    5) journalctl -u "$ARGO_SERVICE_NAME" -n 100 --no-pager ;;
     0) return 0 ;;
     *) error "无效选项。"; return 1 ;;
   esac
@@ -1569,6 +1879,23 @@ system_tools_menu() {
   esac
 }
 
+regenerate_all_configs() {
+  local candidate
+  require_core || return 1
+  init_state || return 1
+  acquire_lock || return 1
+  candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
+  cp -a "$STATE_FILE" "$candidate"
+  if apply_candidate_state "$candidate"; then
+    rm -f "$candidate"
+    sync_firewall_if_managed
+    ok "服务端和全部桌面配置已重新生成、校验并应用。"
+  else
+    rm -f "$candidate"
+    return 1
+  fi
+}
+
 check_configuration() {
   require_core || return 1
   [[ -s "$SERVER_CONFIG" ]] || { error "尚未生成服务端配置。"; return 1; }
@@ -1605,54 +1932,76 @@ install_manager_binary() {
 }
 
 update_manager() {
-  local stamp installer source_url rc
+  local stamp source_url candidate backup new_version
   require_root
   command -v curl >/dev/null 2>&1 || install_dependencies || return 1
   stamp="$(date +%s)"
-  installer="$(mktemp /tmp/mb-singbox-installer.XXXXXX.sh)" || return 1
   source_url="${MANAGER_RAW_BASE}/mb-singbox.sh?ts=${stamp}"
-  if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "${MANAGER_RAW_BASE}/install.sh?ts=${stamp}" -o "$installer"; then
-    rm -f "$installer"
-    error "无法下载 MB-Singbox 引导安装器。"
+  candidate="$(mktemp /tmp/mb-singbox-update.XXXXXX.sh)" || return 1
+  backup="$(mktemp /tmp/mb-singbox-backup.XXXXXX.sh)" || { rm -f "$candidate"; return 1; }
+
+  info "正在从 ${MANAGER_REPO}@${MANAGER_REF} 检查管理器更新..."
+  if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$source_url" -o "$candidate"; then
+    rm -f "$candidate" "$backup"
+    error "无法下载 MB-Singbox 主程序。请确认仓库和分支已经发布。"
     return 1
   fi
-  if ! bash -n "$installer" || ! grep -q '^# Bootstrap installer for mb-singbox\.$' "$installer"; then
-    rm -f "$installer"
-    error "下载内容未通过安装器校验。"
+  if [[ ! -s "$candidate" ]] || ! bash -n "$candidate" || ! grep -q '^PROGRAM="mb-singbox"$' "$candidate"; then
+    rm -f "$candidate" "$backup"
+    error "下载内容未通过程序标识和 Bash 语法检查。"
     return 1
   fi
-  MB_SINGBOX_REPO="$MANAGER_REPO" MB_SINGBOX_REF="$MANAGER_REF" MB_SINGBOX_SOURCE_URL="$source_url" MB_SINGBOX_INSTALL_PATH="$INSTALL_PATH" bash "$installer" version
-  rc=$?
-  rm -f "$installer"
-  (( rc == 0 )) || return "$rc"
-  ok "MB-Singbox 管理器已更新。"
+  new_version="$(awk -F '"' '/^VERSION="[0-9]/ {print $2; exit}' "$candidate")"
+  [[ -n "$new_version" ]] || {
+    rm -f "$candidate" "$backup"
+    error "无法识别下载版本，拒绝更新。"
+    return 1
+  }
+
+  [[ -f "$INSTALL_PATH" ]] && cp -a "$INSTALL_PATH" "$backup"
+  install -m 0755 "$candidate" "$INSTALL_PATH"
+  rm -f "$candidate"
+  if [[ "$("$INSTALL_PATH" version 2>/dev/null)" != "mb-singbox ${new_version}" ]]; then
+    [[ -s "$backup" ]] && install -m 0755 "$backup" "$INSTALL_PATH"
+    rm -f "$backup"
+    error "更新后的管理器自检失败，已恢复旧版本。"
+    return 1
+  fi
+  rm -f "$backup"
+  ok "MB-Singbox 管理器已更新：${VERSION} -> ${new_version}"
 }
 
 maintenance_menu() {
-  local choice
-  printf '\n安装/更新：\n'
-  printf '当前管理器：%s\n' "$VERSION"
-  printf '当前内核：%s\n' "$(current_core_version 2>/dev/null || printf '未安装')"
-  printf '  1. 安装/更新 Sing-box 最新稳定版\n  2. 安装指定 Sing-box 稳定版本\n  3. 更新 MB-Singbox 管理器\n  4. 重新生成桌面端配置\n  0. 返回\n'
-  read -r -p "请选择：" choice
-  case "$choice" in
-    1) install_or_update_core ;;
-    2)
-      read -r -p "版本号（例如 1.13.14）：" choice
-      install_or_update_core "$choice"
-      ;;
-    3)
-      if update_manager; then
-        info "正在重新载入最新版菜单..."
-        exec "$INSTALL_PATH"
-      fi
-      ;;
-    4)
-      require_core && generate_outputs "$STATE_FILE" && ok "桌面端配置已重新生成。"
-      ;;
-    0) return 0 ;;
-    *) error "无效选项。"; return 1 ;;
-  esac
+  local choice version_input
+  while true; do
+    printf '\n安装/更新：\n'
+    printf '当前管理器：%s\n' "$VERSION"
+    printf '当前内核：%s\n' "$(current_core_version 2>/dev/null || printf '未安装')"
+    printf '  1. 安装/更新 Sing-box 最新稳定版\n  2. 安装指定 Sing-box 稳定版本\n  3. 更新 MB-Singbox 管理器\n  4. 重新生成并应用全部配置\n  0. 返回\n'
+    read -r -p "请选择：" choice
+    case "$choice" in
+      1) install_or_update_core; pause ;;
+      2)
+        read -r -p "版本号（例如 1.13.14；输入 0 返回）：" version_input
+        [[ "$version_input" == "0" ]] && continue
+        install_or_update_core "$version_input"
+        pause
+        ;;
+      3)
+        if update_manager; then
+          info "正在重新载入最新版菜单..."
+          exec "$INSTALL_PATH" </dev/tty >/dev/tty 2>/dev/tty
+        fi
+        pause
+        ;;
+      4)
+        regenerate_all_configs
+        pause
+        ;;
+      0) return 0 ;;
+      *) error "无效选项。"; pause ;;
+    esac
+  done
 }
 
 uninstall_all() {
@@ -1728,7 +2077,7 @@ main_menu() {
     read -r -p "请选择：" choice
     printf '\n'
     case "$choice" in
-      1) maintenance_menu; pause ;;
+      1) maintenance_menu ;;
       2) add_node_menu; pause ;;
       3) view_node_menu; pause ;;
       4) edit_node; pause ;;
@@ -1754,7 +2103,7 @@ ${PROGRAM} ${VERSION}
   ${PROGRAM} install-core VERSION
   ${PROGRAM} update-manager  更新 MB-Singbox 管理器
   ${PROGRAM} check           检查当前服务端配置
-  ${PROGRAM} render          重新生成服务端与桌面端配置
+  ${PROGRAM} render          重新生成、校验并应用全部配置
   ${PROGRAM} status          查看状态
   ${PROGRAM} version
 
@@ -1771,13 +2120,7 @@ main() {
     install-core) require_root; shift; install_or_update_core "${1:-}" ;;
     update-manager) update_manager ;;
     check) require_root; check_configuration ;;
-    render)
-      require_root; require_core; init_state
-      local candidate
-      candidate="$(mktemp "${ROOT_DIR}/.server.XXXXXX.json")" || return 1
-      render_server_config "$STATE_FILE" "$candidate" && "$SINGBOX_BIN" check -c "$candidate" && install -m 0600 "$candidate" "$SERVER_CONFIG" && generate_outputs "$STATE_FILE"
-      rm -f "$candidate"
-      ;;
+    render) require_root; regenerate_all_configs ;;
     status) require_root; init_state; show_status_line; list_nodes ;;
     version|--version|-v) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     help|--help|-h) show_help ;;

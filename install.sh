@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 DEFAULT_REPO="BBMCoin04/mb-singbox"
 REPO="${MB_SINGBOX_REPO:-$DEFAULT_REPO}"
 REF="${MB_SINGBOX_REF:-main}"
