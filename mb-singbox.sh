@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# mb-singbox: state-driven Sing-box manager for Linux VPS hosts.
+# mb-singbox: state-driven sing-box manager for Linux VPS hosts.
 # jq expressions intentionally use single quotes so jq expands their $variables.
 # shellcheck disable=SC2016
 
 set -uo pipefail
 umask 077
 
-VERSION="0.4.2"
+VERSION="0.4.3"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
-QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/singbox}"
+QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/mb-singbox}"
+LEGACY_QUICK_PATH="${MB_SINGBOX_LEGACY_QUICK_PATH:-/usr/local/bin/singbox}"
 MANAGER_REPO="${MB_SINGBOX_REPO:-BBMCoin04/mb-singbox}"
 MANAGER_REF="${MB_SINGBOX_REF:-main}"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/${MANAGER_REF}"
@@ -127,7 +128,8 @@ validate_managed_layout() {
   path_is_within "$QR_DIR" "$ROOT_DIR" || { error "二维码目录必须位于 ${ROOT_DIR} 内。"; return 1; }
   path_is_within "$BACKUP_DIR" "$ROOT_DIR" || { error "备份目录必须位于 ${ROOT_DIR} 内。"; return 1; }
   [[ "$(basename "$INSTALL_PATH")" == "mb-singbox" ]] || { error "管理器安装文件名必须是 mb-singbox。"; return 1; }
-  [[ "$(basename "$QUICK_PATH")" == "singbox" ]] || { error "快捷命令文件名必须是 singbox。"; return 1; }
+  [[ "$(basename "$QUICK_PATH")" == "mb-singbox" ]] || { error "主命令文件名必须是 mb-singbox。"; return 1; }
+  [[ "$(basename "$LEGACY_QUICK_PATH")" == "singbox" ]] || { error "兼容命令文件名必须是 singbox。"; return 1; }
   [[ "$BACKUP_KEEP" =~ ^[0-9]+$ ]] && (( BACKUP_KEEP >= 1 && BACKUP_KEEP <= 100 )) || {
     error "MB_SINGBOX_BACKUP_KEEP 必须是 1 到 100。"
     return 1
@@ -142,12 +144,13 @@ safe_to_remove_managed_root() {
 
 write_managed_marker() {
   local marker="${1}/${MANAGED_MARKER_NAME}"
-  printf 'MB-Singbox managed directory\n' > "$marker" || return 1
+  printf 'mb-singbox managed directory\n' > "$marker" || return 1
   chmod 0600 "$marker"
 }
 
 managed_marker_valid() {
-  [[ -f "${1}/${MANAGED_MARKER_NAME}" ]] && grep -qx 'MB-Singbox managed directory' "${1}/${MANAGED_MARKER_NAME}"
+  [[ -f "${1}/${MANAGED_MARKER_NAME}" ]] &&
+    grep -Eq '^(mb-singbox|MB-Singbox|MB sing-box 管理器) managed directory$' "${1}/${MANAGED_MARKER_NAME}"
 }
 
 ensure_directories() {
@@ -172,7 +175,7 @@ acquire_lock() {
   ensure_directories
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
-    error "另一个 MB-Singbox 操作正在进行。"
+    error "另一个 MB sing-box 管理器操作正在进行。"
     return 1
   fi
 }
@@ -300,6 +303,8 @@ state_valid() {
     .schema == 1 and
     (.server_address | text) and
     (.firewall_managed | type == "boolean") and
+    ((.firewall_mode // (if .firewall_managed then "managed" else "external" end)) |
+      . == "external" or . == "permissive" or . == "managed") and
     (.nodes | type == "array" and all(.[]; valid_node)) and
     (([.nodes[].id] | length) == ([.nodes[].id] | unique | length)) and
     (([.nodes[] | ((if .type == "hysteria2" or .type == "tuic" then "udp:" else "tcp:" end) + (.port | tostring))] | length) ==
@@ -353,6 +358,7 @@ init_state() {
     }
     normalized="$(mktemp "${ROOT_DIR}/.state-normalize.XXXXXX.json")" || return 1
     if ! jq '
+      .firewall_mode //= (if .firewall_managed then "managed" else "external" end) |
       .argo.provisioned //= false |
       .argo.verified //= false |
       .argo.tunnel_id //= "" |
@@ -388,6 +394,7 @@ init_state() {
     server_address: "",
     created_at: $now,
     firewall_managed: false,
+    firewall_mode: "external",
     nodes: [],
     argo: {
       enabled: false,
@@ -489,7 +496,7 @@ current_core_version() {
 download_core() {
   local version="${1:-}" arch archive_url release_json temp_dir archive expected actual extracted
   [[ -n "$version" ]] || version="$(latest_stable_version)" || {
-    error "无法取得 Sing-box 最新稳定版。"
+    error "无法取得 sing-box 最新稳定版。"
     return 1
   }
   version="${version#v}"
@@ -502,11 +509,11 @@ download_core() {
   archive="sing-box-${version}-linux-${arch}.tar.gz"
   release_json="$temp_dir/release.json"
 
-  info "正在读取 Sing-box ${version} 官方 Release 元数据..." >&2
+  info "正在读取 sing-box ${version} 官方 Release 元数据..." >&2
   if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL \
     "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${version}" -o "$release_json"; then
     rm -rf "$temp_dir"
-    error "无法取得 Sing-box Release 元数据。"
+    error "无法取得 sing-box Release 元数据。"
     return 1
   fi
   if jq -e '.prerelease or .draft' "$release_json" >/dev/null; then
@@ -525,27 +532,27 @@ download_core() {
     return 1
   }
 
-  info "正在下载 Sing-box ${version} (${arch})..." >&2
+  info "正在下载 sing-box ${version} (${arch})..." >&2
   if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$archive_url" -o "$temp_dir/$archive"; then
     rm -rf "$temp_dir"
-    error "Sing-box 下载失败。"
+    error "sing-box 下载失败。"
     return 1
   fi
   actual="$(sha256sum "$temp_dir/$archive" | awk '{print $1}')"
   if [[ "$actual" != "$expected" ]]; then
     rm -rf "$temp_dir"
-    error "Sing-box SHA-256 校验失败，拒绝安装。"
+    error "sing-box SHA-256 校验失败，拒绝安装。"
     return 1
   fi
   if ! tar -xzf "$temp_dir/$archive" -C "$temp_dir"; then
     rm -rf "$temp_dir"
-    error "Sing-box 压缩包无法解压。"
+    error "sing-box 压缩包无法解压。"
     return 1
   fi
   extracted="$temp_dir/sing-box-${version}-linux-${arch}/sing-box"
   if [[ ! -x "$extracted" ]]; then
     rm -rf "$temp_dir"
-    error "压缩包中没有找到 Sing-box 二进制。"
+    error "压缩包中没有找到 sing-box 二进制。"
     return 1
   fi
   printf '%s\n' "$extracted"
@@ -556,7 +563,7 @@ write_service_file() {
   temporary="$(mktemp /tmp/mb-singbox-service.XXXXXX)" || return 1
   cat > "$temporary" <<EOF
 [Unit]
-Description=MB-Singbox managed proxy service
+Description=MB sing-box manager proxy service
 Wants=network-online.target
 After=network-online.target nss-lookup.target
 
@@ -622,13 +629,13 @@ install_or_update_core() {
   }
   if [[ "$(printf '%s\n' "1.13.0" "$version" | sort -V | head -n 1)" != "1.13.0" ]]; then
     rm -rf -- "$temp_root"
-    error "MB-Singbox ${VERSION} 最低支持 Sing-box 1.13.0，拒绝安装 ${version}。"
+    error "MB sing-box 管理器 ${VERSION} 最低支持 sing-box 1.13.0，拒绝安装 ${version}。"
     return 1
   fi
 
   if [[ -s "$SERVER_CONFIG" ]] && ! "$extracted" check -c "$SERVER_CONFIG"; then
     rm -rf -- "$temp_root"
-    error "现有服务端配置未通过 Sing-box ${version} 检查，不会更新内核。"
+    error "现有服务端配置未通过 sing-box ${version} 检查，不会更新内核。"
     return 1
   fi
 
@@ -640,7 +647,7 @@ install_or_update_core() {
   if ! atomic_install_file "$extracted" "$SINGBOX_BIN" 0755; then
     rm -f -- "$backup"
     rm -rf -- "$temp_root"
-    error "无法原子安装 Sing-box 内核。"
+    error "无法原子安装 sing-box 内核。"
     return 1
   fi
   rm -rf -- "$temp_root"
@@ -663,13 +670,13 @@ install_or_update_core() {
     info "服务更新前处于停止状态，本次不会自动启动。"
   fi
   rm -f -- "$backup"
-  ok "Sing-box ${version} 已安装到 ${SINGBOX_BIN}"
+  ok "sing-box ${version} 已安装到 ${SINGBOX_BIN}"
   [[ -n "$current" ]] && info "更新前版本：${current}"
 }
 
 require_core() {
   if [[ ! -x "$SINGBOX_BIN" ]]; then
-    error "尚未安装 Sing-box 内核，请先选择 '安装/更新 Sing-box'。"
+    error "尚未安装 sing-box 内核，请先选择 '安装/更新 sing-box'。"
     return 1
   fi
 }
@@ -1215,7 +1222,7 @@ generate_outputs() {
   local client_config
   while IFS= read -r client_config; do
     if ! "$SINGBOX_BIN" check -c "$client_config" >/dev/null; then
-      error "客户端候选配置未通过 Sing-box 检查：$(basename "$client_config")"
+      error "客户端候选配置未通过 sing-box 检查：$(basename "$client_config")"
       rm -rf "$temp_root"
       return 1
     fi
@@ -1297,7 +1304,7 @@ apply_candidate_state() {
   }
   if ! "$SINGBOX_BIN" check -c "$candidate_config"; then
     rm -f -- "$candidate_config"
-    error "候选配置未通过 Sing-box 检查，不会替换现有配置。"
+    error "候选配置未通过 sing-box 检查，不会替换现有配置。"
     return 1
   fi
   backup="$(backup_current)" || { rm -f -- "$candidate_config"; return 1; }
@@ -1470,7 +1477,7 @@ choose_port() {
     if ! validate_port "$input"; then
       error "端口必须是 1 到 65535 的整数。"
     elif port_in_state "$input" "$network"; then
-      error "${network^^} ${input} 已被另一个 MB-Singbox 节点使用。"
+      error "${network^^} ${input} 已被另一个 MB sing-box 管理器 节点使用。"
     elif port_listening "$input" "$network"; then
       error "系统中已有程序监听 ${network^^} ${input}。"
     else
@@ -1620,7 +1627,7 @@ add_reality_node() {
   node="$(jq -n --arg id "$id" --arg name "$name" --argjson port "$port" --arg uuid "$uuid" --arg server_name "$target" --arg private_key "$private_key" --arg public_key "$public_key" --arg short_id "$short_id" '{id:$id,name:$name,type:"reality",port:$port,uuid:$uuid,server_name:$server_name,private_key:$private_key,public_key:$public_key,short_id:$short_id}')"
   info "正在对 ${target}:443 执行临时 Reality 端到端校验..."
   reality_target_compatible "$node" || {
-    error "该握手目标与当前网络或 Sing-box 内核不兼容，节点未创建。"
+    error "该握手目标与当前网络或 sing-box 内核不兼容，节点未创建。"
     return 1
   }
   ok "Reality 握手目标已通过端到端校验。"
@@ -1808,7 +1815,7 @@ choose_port_for_node() {
         (if $network == "udp" then (.type=="hysteria2" or .type=="tuic") else (.type=="reality" or .type=="anytls" or .type=="vmess") end)
       ) or (.argo.enabled and $network=="tcp" and .argo.origin_port==$port)
     ' "$STATE_FILE" >/dev/null; then
-      error "${network^^} ${input} 已被另一个 MB-Singbox 入站使用。"
+      error "${network^^} ${input} 已被另一个 MB sing-box 管理器 入站使用。"
     elif port_listening "$input" "$network"; then
       error "系统中已有程序监听 ${network^^} ${input}。"
     else
@@ -1882,7 +1889,7 @@ edit_node() {
         test_node="$(jq --arg value "$value" '.server_name=$value' <<<"$node")"
         info "正在对 ${value}:443 执行临时 Reality 端到端校验..."
         reality_target_compatible "$test_node" || {
-          error "该握手目标与当前网络或 Sing-box 内核不兼容，配置未修改。"
+          error "该握手目标与当前网络或 sing-box 内核不兼容，配置未修改。"
           return 1
         }
         ok "Reality 握手目标已通过端到端校验。"
@@ -2034,7 +2041,7 @@ write_argo_service() {
   if [[ "$mode" == "named" ]]; then
     cat > "$temporary" <<EOF
 [Unit]
-Description=MB-Singbox Cloudflare Named Tunnel
+Description=MB sing-box manager Cloudflare Named Tunnel
 Wants=network-online.target ${SERVICE_NAME}
 After=network-online.target ${SERVICE_NAME}
 
@@ -2059,7 +2066,7 @@ EOF
   else
     cat > "$temporary" <<EOF
 [Unit]
-Description=MB-Singbox Cloudflare Quick Tunnel
+Description=MB sing-box manager Cloudflare Quick Tunnel
 Wants=network-online.target ${SERVICE_NAME}
 After=network-online.target ${SERVICE_NAME}
 
@@ -2416,7 +2423,7 @@ refresh_quick_argo() {
 disable_argo() {
   local candidate
   jq -e '.argo.enabled' "$STATE_FILE" >/dev/null || { info "Argo 当前未启用。"; return 0; }
-  warn "将停止并删除 MB-Singbox 的本地 cloudflared 服务。"
+  warn "将停止并删除 MB sing-box 管理器的本地 cloudflared 服务。"
   warn "Cloudflare 账户中的 Named Tunnel 不会被删除。"
   confirm "确定停用 Argo？" || return 0
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
@@ -2463,10 +2470,64 @@ ufw_is_active() {
   command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'
 }
 
+firewalld_is_active() {
+  command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null
+}
+
+firewall_mode_label() {
+  jq -r '
+    (.firewall_mode // (if .firewall_managed then "managed" else "external" end)) as $mode |
+    if $mode == "permissive" then "宽松模式"
+    elif $mode == "managed" then "节点端口收紧模式"
+    else "外部管理"
+    end
+  ' "$STATE_FILE" 2>/dev/null || printf '未知'
+}
+
+save_firewall_mode() {
+  local mode="$1" managed="$2" candidate
+  candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
+  if ! jq --arg mode "$mode" --argjson managed "$managed" \
+      '.firewall_mode=$mode | .firewall_managed=$managed' "$STATE_FILE" > "$candidate" ||
+     ! state_valid "$candidate" || ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  rm -f -- "$candidate"
+}
+
+configure_permissive_firewall() {
+  local ufw_was_active=0 firewalld_was_active=0
+  warn "宽松模式会停用 UFW 和 firewalld，主机入站端口将不再由它们限制。"
+  warn "不会清空 iptables/nftables，也不会破坏 Docker 创建的 NAT、转发和容器网络规则。"
+  warn "云厂商安全组仍需在控制台单独放行。"
+  confirm "确认切换到防火墙宽松模式？" || return 0
+
+  ufw_is_active && ufw_was_active=1
+  firewalld_is_active && firewalld_was_active=1
+  if (( ufw_was_active )) && ! ufw --force disable; then
+    error "UFW 停用失败，宽松模式未生效。"
+    return 1
+  fi
+  if (( firewalld_was_active )) && ! systemctl disable --now firewalld; then
+    (( ufw_was_active )) && ufw --force enable >/dev/null 2>&1 || true
+    error "firewalld 停用失败，已尝试恢复 UFW。"
+    return 1
+  fi
+  if ! save_firewall_mode permissive false; then
+    (( ufw_was_active )) && ufw --force enable >/dev/null 2>&1 || true
+    (( firewalld_was_active )) && systemctl enable --now firewalld >/dev/null 2>&1 || true
+    error "宽松模式状态保存失败，已尝试恢复原防火墙状态。"
+    return 1
+  fi
+  ok "防火墙宽松模式已启用；UFW/firewalld 不再限制节点或 Docker 入站端口。"
+}
+
 remove_managed_ufw_rules() {
   local numbers number
   command -v ufw >/dev/null 2>&1 || return 0
-  numbers="$(LC_ALL=C ufw status numbered 2>/dev/null | sed -n '/#[[:space:]]*MB-Singbox/s/^\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' | sort -rn)"
+  numbers="$(LC_ALL=C ufw status numbered 2>/dev/null |
+    sed -nE '/#[[:space:]]*(mb-singbox|MB-Singbox)/s/^\[[[:space:]]*([0-9][0-9]*)\].*/\1/p' | sort -rn)"
   while IFS= read -r number; do
     [[ -z "$number" ]] || ufw --force delete "$number" >/dev/null || return 1
   done <<<"$numbers"
@@ -2479,7 +2540,7 @@ desired_ufw_rules() {
       hysteria2|tuic) protocol=udp ;;
       *) protocol=tcp ;;
     esac
-    printf '%s\t%s\tMB-Singbox %s %s\n' "$protocol" "$port" "${protocol^^}" "$port"
+    printf '%s\t%s\tmb-singbox %s %s\n' "$protocol" "$port" "${protocol^^}" "$port"
   done < <(jq -r '.nodes[] | [.type, .port] | @tsv' "$STATE_FILE")
 }
 
@@ -2495,13 +2556,15 @@ remove_obsolete_ufw_rules() {
   local -a desired_rules=()
   mapfile -t desired_rules < <(desired_ufw_rules | awk -F '\t' '{print $2 "/" $1}')
   while IFS= read -r line; do
-    [[ "$line" == *"# MB-Singbox"* ]] || continue
+    [[ "$line" == *"# mb-singbox"* || "$line" == *"# MB-Singbox"* ]] || continue
     number="$(sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' <<<"$line")"
     rule="$(sed -n 's/^\[[[:space:]]*[0-9][0-9]*\][[:space:]]*\([^[:space:]]*\).*/\1/p' <<<"$line")"
     wanted=0
-    for desired in "${desired_rules[@]}"; do
-      [[ "$rule" == "$desired" ]] && { wanted=1; break; }
-    done
+    if [[ "$line" == *"# mb-singbox"* ]]; then
+      for desired in "${desired_rules[@]}"; do
+        [[ "$rule" == "$desired" ]] && { wanted=1; break; }
+      done
+    fi
     [[ -z "$number" ]] || (( wanted )) || numbers+="${number}"$'\n'
   done < <(LC_ALL=C ufw status numbered 2>/dev/null)
   while IFS= read -r number; do
@@ -2537,70 +2600,101 @@ detect_ssh_ports() {
   fi
 }
 
+fallback_to_permissive_firewall() {
+  local reason="$1"
+  warn "${reason}；按可用性优先策略自动退回宽松模式。"
+  if ufw_is_active && ! ufw --force disable; then
+    error "UFW 同步失败且无法停用，请立即检查节点端口和 SSH 连通性。"
+    return 1
+  fi
+  if firewalld_is_active && ! systemctl disable --now firewalld; then
+    error "firewalld 无法停用，请立即检查节点端口。"
+    return 1
+  fi
+  if ! save_firewall_mode permissive false; then
+    error "防火墙已尝试放宽，但状态保存失败，请重新进入防火墙菜单检查。"
+    return 1
+  fi
+  warn "当前已是宽松模式，节点端口不再受 UFW/firewalld 限制。"
+}
+
 sync_firewall_if_managed() {
   jq -e '.firewall_managed' "$STATE_FILE" >/dev/null 2>&1 || return 0
-  sync_ufw_rules || warn "自动同步 UFW 规则失败，请从系统工具菜单检查。"
+  sync_ufw_rules || fallback_to_permissive_firewall "自动同步 UFW 节点端口失败"
 }
 
 configure_ufw() {
-  local ssh_port candidate
+  local ssh_port firewalld_was_active=0
   local -a ssh_ports=()
   if ! command -v ufw >/dev/null 2>&1; then
-    confirm "系统没有 UFW，是否安装？" || return 0
+    confirm "系统没有 UFW，是否安装并进入节点端口收紧模式？" || return 0
     if command -v apt-get >/dev/null 2>&1; then
       apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ufw || return 1
     else
-      error "当前系统请手动安装 UFW。"
+      error "当前系统无法自动安装 UFW；请继续使用宽松模式，或手动配置防火墙。"
       return 1
     fi
   fi
-  if ! ufw_is_active; then
-    mapfile -t ssh_ports < <(detect_ssh_ports)
-    if (( ${#ssh_ports[@]} == 0 )); then
-      read -r -p "无法自动识别 SSH 端口，请输入当前 SSH 端口（输入 0 取消）：" ssh_port
-      [[ "$ssh_port" == "0" ]] && return 0
-      validate_port "$ssh_port" || { error "SSH 端口格式不正确，已取消启用 UFW。"; return 1; }
-      ssh_ports=("$ssh_port")
-    fi
-    warn "启用 UFW 会改变服务器入站防火墙。将先放行 SSH TCP：${ssh_ports[*]}，再放行全部节点端口。"
-    confirm "确认端口无误并启用 UFW？" || return 0
-    for ssh_port in "${ssh_ports[@]}"; do
-      ufw allow "${ssh_port}/tcp" comment "SSH before MB-Singbox" >/dev/null || return 1
-    done
-    add_desired_ufw_rules || { error "节点规则添加失败，不会启用 UFW。"; return 1; }
-    ufw --force enable || return 1
+
+  mapfile -t ssh_ports < <(detect_ssh_ports)
+  if (( ${#ssh_ports[@]} == 0 )); then
+    read -r -p "无法自动识别 SSH 端口，请输入当前 SSH 端口（输入 0 取消）：" ssh_port
+    [[ "$ssh_port" == "0" ]] && return 0
+    validate_port "$ssh_port" || { error "SSH 端口格式不正确，已取消收紧。"; return 1; }
+    ssh_ports=("$ssh_port")
   fi
-  sync_ufw_rules || return 1
-  candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  if ! jq '.firewall_managed=true' "$STATE_FILE" > "$candidate" || ! state_valid "$candidate" ||
-     ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
-    rm -f -- "$candidate"
+
+  firewalld_is_active && firewalld_was_active=1
+  warn "节点端口收紧模式会把 UFW 默认入站策略设为拒绝。"
+  warn "将保留现有 UFW 规则，并先放行 SSH TCP：${ssh_ports[*]} 以及当前全部节点端口。"
+  warn "Docker 发布端口通常由 Docker 自己的规则处理；脚本不会清空或重写 Docker 链。"
+  (( firewalld_was_active )) && warn "当前 firewalld 正在运行；确认后将停用它，避免与 UFW 同时管理。"
+  confirm "确认进入节点端口收紧模式？" || return 0
+
+  for ssh_port in "${ssh_ports[@]}"; do
+    ufw allow "${ssh_port}/tcp" comment "SSH before mb-singbox" >/dev/null || return 1
+  done
+  add_desired_ufw_rules || { error "节点规则添加失败，不会启用 UFW。"; return 1; }
+  ufw default deny incoming >/dev/null || return 1
+  ufw default allow outgoing >/dev/null || return 1
+  if (( firewalld_was_active )) && ! systemctl disable --now firewalld; then
+    error "firewalld 停用失败，不会启用 UFW。"
     return 1
   fi
-  rm -f -- "$candidate"
-  ok "MB-Singbox 将在节点增删后自动同步自己的 UFW 规则。"
+  if ! ufw_is_active && ! ufw --force enable; then
+    (( firewalld_was_active )) && systemctl enable --now firewalld >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! sync_ufw_rules; then
+    fallback_to_permissive_firewall "节点端口收紧模式配置失败" || true
+    return 1
+  fi
+  if ! save_firewall_mode managed true; then
+    fallback_to_permissive_firewall "节点端口收紧状态保存失败" || true
+    return 1
+  fi
+  ok "节点端口收紧模式已启用；节点增删后会自动同步 UFW 端口，失败时自动退回宽松模式。"
 }
 
 disable_ufw_management() {
-  local candidate
-  warn "只会删除 MB-Singbox 节点规则，不会停用 UFW，也不会删除 SSH 或其他规则。"
-  confirm "确定停止管理并删除 MB-Singbox UFW 规则？" || return 0
-  candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  if ! jq '.firewall_managed=false' "$STATE_FILE" > "$candidate" || ! state_valid "$candidate" ||
-     ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
-    rm -f -- "$candidate"
+  warn "将停止自动管理并删除 mb-singbox 节点规则，但不会启用或停用 UFW/firewalld。"
+  confirm "确定改为外部管理防火墙？" || return 0
+  if ! remove_managed_ufw_rules; then
+    warn "部分 UFW 规则删除失败，管理状态保持不变。"
     return 1
   fi
-  rm -f -- "$candidate"
-  remove_managed_ufw_rules || { warn "部分 UFW 规则删除失败，请手动检查。"; return 1; }
-  ok "已停止管理 UFW。"
+  save_firewall_mode external false || {
+    error "防火墙管理状态保存失败。"
+    return 1
+  }
+  ok "防火墙已改为外部管理。"
 }
 
 show_bbr_status() {
   printf '当前拥塞控制：%s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
   printf '可用算法：%s\n' "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || printf '未知')"
   printf '默认队列：%s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '未知')"
-  [[ -f "$BBR_FILE" ]] && printf 'MB-Singbox BBR：已配置\n' || printf 'MB-Singbox BBR：未配置\n'
+  [[ -f "$BBR_FILE" ]] && printf 'MB sing-box 管理器 BBR：已配置\n' || printf 'MB sing-box 管理器 BBR：未配置\n'
 }
 
 enable_bbr() {
@@ -2611,7 +2705,7 @@ enable_bbr() {
   fi
   candidate="$(mktemp /tmp/mb-singbox-bbr.XXXXXX)" || return 1
   cat > "$candidate" <<'EOF'
-# Managed by MB-Singbox.
+# Managed by MB sing-box 管理器.
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
@@ -2641,10 +2735,10 @@ EOF
 }
 
 disable_bbr() {
-  [[ -f "$BBR_FILE" ]] || { info "MB-Singbox 没有创建 BBR 配置。"; return 0; }
+  [[ -f "$BBR_FILE" ]] || { info "MB sing-box 管理器 没有创建 BBR 配置。"; return 0; }
   rm -f "$BBR_FILE"
   sysctl --system >/dev/null || true
-  ok "已删除 MB-Singbox 的 BBR 配置，并重新加载系统原有 sysctl 配置。"
+  ok "已删除 MB sing-box 管理器的 BBR 配置，并重新加载系统原有 sysctl 配置。"
 }
 
 http_probe() {
@@ -2760,20 +2854,50 @@ client_settings_menu() {
   done
 }
 
+firewall_menu() {
+  local choice
+  while true; do
+    printf '\n防火墙模式：%s\n' "$(firewall_mode_label)"
+    if ufw_is_active; then printf 'UFW：运行中\n'; else printf 'UFW：未运行或未安装\n'; fi
+    if firewalld_is_active; then printf 'firewalld：运行中\n'; else printf 'firewalld：未运行或未安装\n'; fi
+    printf 'Docker：保留其 iptables/nftables、NAT 和转发规则\n'
+    printf '  1. 宽松模式（停用 UFW/firewalld）\n'
+    printf '  2. 节点端口收紧模式（UFW：SSH + 当前节点）\n'
+    printf '  3. 立即同步节点 UFW 规则\n'
+    printf '  4. 改为外部管理防火墙\n'
+    printf '  0. 返回\n'
+    read -r -p "请选择：" choice
+    case "$choice" in
+      1) configure_permissive_firewall ;;
+      2) configure_ufw ;;
+      3)
+        if jq -e '.firewall_managed' "$STATE_FILE" >/dev/null 2>&1; then
+          sync_ufw_rules
+        else
+          error "当前不是节点端口收紧模式。"
+        fi
+        ;;
+      4) disable_ufw_management ;;
+      0) return 0 ;;
+      *) error "无效选项。" ;;
+    esac
+    pause
+  done
+}
+
 system_tools_menu() {
   local choice
   while true; do
     printf '\n系统工具：\n'
     show_bbr_status
-    if ufw_is_active; then printf 'UFW：已启用\n'; else printf 'UFW：未启用或未安装\n'; fi
-    printf '  1. 启用 BBR + fq\n  2. 关闭 MB-Singbox 配置的 BBR\n  3. 配置并同步 UFW\n  4. 停止管理 UFW\n  5. AI 服务可用性检测\n  0. 返回\n'
+    printf '防火墙：%s\n' "$(firewall_mode_label)"
+    printf '  1. 启用 BBR + fq\n  2. 关闭 MB sing-box 管理器配置的 BBR\n  3. 防火墙宽松/收紧设置\n  4. AI 服务可用性检测\n  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
       1) enable_bbr ;;
       2) disable_bbr ;;
-      3) configure_ufw ;;
-      4) disable_ufw_management ;;
-      5) check_ai_access ;;
+      3) firewall_menu ;;
+      4) check_ai_access ;;
       0) return 0 ;;
       *) error "无效选项。" ;;
     esac
@@ -2853,7 +2977,7 @@ service_menu() {
         ;;
       4)
         if check_configuration; then
-          ok "Sing-box 服务端配置检查通过。"
+          ok "sing-box 服务端配置检查通过。"
         fi
         ;;
       5) journalctl -u "$SERVICE_NAME" -n 50 --no-pager ;;
@@ -2870,23 +2994,41 @@ service_menu() {
 }
 
 install_quick_command() {
-  install -d -m 0755 "$(dirname "$QUICK_PATH")" || return 1
+  install -d -m 0755 "$(dirname "$QUICK_PATH")" "$(dirname "$LEGACY_QUICK_PATH")" || return 1
   if [[ -e "$QUICK_PATH" || -L "$QUICK_PATH" ]]; then
     if [[ "$(readlink -f "$QUICK_PATH" 2>/dev/null || true)" != "$INSTALL_PATH" ]]; then
-      error "快捷命令路径已被其他程序占用：${QUICK_PATH}"
+      error "主命令路径已被其他程序占用：${QUICK_PATH}"
       return 1
     fi
   else
     ln -s "$INSTALL_PATH" "$QUICK_PATH" || return 1
   fi
+
+  if [[ -e "$LEGACY_QUICK_PATH" || -L "$LEGACY_QUICK_PATH" ]]; then
+    if [[ "$(readlink -f "$LEGACY_QUICK_PATH" 2>/dev/null || true)" != "$INSTALL_PATH" ]]; then
+      warn "兼容命令已被其他程序占用，将只使用 ${QUICK_PATH}：${LEGACY_QUICK_PATH}"
+    fi
+  elif ! ln -s "$INSTALL_PATH" "$LEGACY_QUICK_PATH"; then
+    warn "兼容命令创建失败；主命令 ${QUICK_PATH} 不受影响。"
+  fi
 }
 
 install_manager_binary() {
+  local installed_version=""
   install -d -m 0755 "$(dirname "$INSTALL_PATH")" || return 1
   if [[ "$SELF_PATH" == "$INSTALL_PATH" ]]; then
     chmod 0755 "$INSTALL_PATH" || return 1
   elif [[ -n "$SELF_PATH" && -f "$SELF_PATH" ]]; then
-    atomic_install_file "$SELF_PATH" "$INSTALL_PATH" 0755 || return 1
+    if [[ -x "$INSTALL_PATH" ]]; then
+      installed_version="$("$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}' || true)"
+    fi
+    if [[ "$installed_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+       [[ "$(printf '%s\n' "$VERSION" "$installed_version" | sort -V | head -n 1)" == "$VERSION" ]] &&
+       [[ "$installed_version" != "$VERSION" ]]; then
+      warn "固定管理器 ${installed_version} 新于当前脚本 ${VERSION}，不会用旧脚本覆盖。"
+    else
+      atomic_install_file "$SELF_PATH" "$INSTALL_PATH" 0755 || return 1
+    fi
   else
     error "当前脚本来自临时数据流，无法安装固定副本。请使用 install.sh。"
     return 1
@@ -2906,7 +3048,7 @@ update_manager() {
   info "正在从 ${MANAGER_REPO}@${MANAGER_REF} 检查管理器更新..."
   if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$source_url" -o "$candidate"; then
     rm -f "$candidate" "$backup"
-    error "无法下载 MB-Singbox 主程序。请确认仓库和分支已经发布。"
+    error "无法下载 MB sing-box 管理器 主程序。请确认仓库和分支已经发布。"
     return 1
   fi
   if [[ ! -s "$candidate" ]] || ! bash -n "$candidate" || ! grep -q '^PROGRAM="mb-singbox"$' "$candidate"; then
@@ -2943,7 +3085,8 @@ update_manager() {
     return 1
   fi
   rm -f -- "$backup"
-  ok "MB-Singbox 管理器已更新：${VERSION} -> ${new_version}"
+  install_quick_command || warn "管理器已更新，但主命令或兼容命令检查失败。"
+  ok "MB sing-box 管理器已更新：${VERSION} -> ${new_version}"
 }
 
 maintenance_menu() {
@@ -2952,7 +3095,7 @@ maintenance_menu() {
     printf '\n安装/更新：\n'
     printf '当前管理器：%s\n' "$VERSION"
     printf '当前内核：%s\n' "$(current_core_version 2>/dev/null || printf '未安装')"
-    printf '  1. 安装/更新 Sing-box 最新稳定版\n  2. 安装指定 Sing-box 稳定版本\n  3. 更新 MB-Singbox 管理器\n  4. 重新生成并应用全部配置\n  5. 运行安装诊断\n  0. 返回\n'
+    printf '  1. 安装/更新 sing-box 最新稳定版\n  2. 安装指定 sing-box 稳定版本\n  3. 更新 MB sing-box 管理器\n  4. 重新生成并应用全部配置\n  5. 运行安装诊断\n  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
       1) install_or_update_core; pause ;;
@@ -2985,10 +3128,10 @@ uninstall_all() {
   init_state || return 1
   validate_managed_layout || return 1
   printf '\n%s彻底卸载范围%s\n' "$C_BOLD" "$C_RESET"
-  printf '将删除：MB-Singbox 服务、内核、状态、服务端/客户端配置、链接、二维码、备份、日志、cloudflared 本地服务、UFW 自建规则和 BBR sysctl 文件。\n'
+  printf '将删除：MB sing-box 管理器服务、内核、状态、服务端/客户端配置、链接、二维码、备份、日志、cloudflared 本地服务、UFW 自建规则和 BBR sysctl 文件。\n'
   printf '不会删除：MB-ACME、/etc/acme/certs、Cloudflare 远程 Named Tunnel、系统其他 UFW/sysctl 配置。\n'
   warn "该操作不可恢复，客户端配置和节点密钥也会被删除。"
-  confirm "确认彻底卸载 MB-Singbox？" || return 0
+  confirm "确认彻底卸载 MB sing-box 管理器？" || return 0
   read -r -p "请输入 DELETE 确认：" _confirm_word
   [[ "$_confirm_word" == "DELETE" ]] || { info "已取消。"; return 0; }
 
@@ -3008,25 +3151,30 @@ uninstall_all() {
   if [[ -L "$QUICK_PATH" && "$(readlink -f "$QUICK_PATH" 2>/dev/null || true)" == "$INSTALL_PATH" ]]; then
     rm -f "$QUICK_PATH"
   fi
+  if [[ -L "$LEGACY_QUICK_PATH" && "$(readlink -f "$LEGACY_QUICK_PATH" 2>/dev/null || true)" == "$INSTALL_PATH" ]]; then
+    rm -f "$LEGACY_QUICK_PATH"
+  fi
   rm -f "$INSTALL_PATH"
-  ok "MB-Singbox 本地资源已彻底卸载。"
+  ok "MB sing-box 管理器本地资源已彻底卸载。"
   exit 0
 }
 
 show_status_line() {
-  local core service nodes argo
+  local core service nodes argo firewall
   core="$(current_core_version 2>/dev/null || printf '未安装')"
   if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then service="运行中"; else service="已停止"; fi
   nodes="$(jq '.nodes|length' "$STATE_FILE" 2>/dev/null || printf '0')"
   if jq -e '.argo.enabled' "$STATE_FILE" >/dev/null 2>&1; then argo="已启用"; else argo="未启用"; fi
-  printf 'Sing-box：%s  服务：%s  节点：%s  Argo：%s\n' "$core" "$service" "$nodes" "$argo"
+  firewall="$(firewall_mode_label)"
+  printf 'sing-box：%s  服务：%s  节点：%s  Argo：%s  防火墙：%s\n' "$core" "$service" "$nodes" "$argo" "$firewall"
 }
 
 doctor() {
-  local installed_version="未安装" installed_hash="未知" remote_version="无法获取" quick_target="不存在" service_state="未知"
+  local installed_version="未安装" installed_hash="未知" remote_version="无法获取" quick_target="不存在" legacy_target="不存在" service_state="未知"
   [[ ! -x "$INSTALL_PATH" ]] || installed_version="$("$INSTALL_PATH" version 2>/dev/null || printf '无法执行')"
   [[ ! -f "$INSTALL_PATH" ]] || installed_hash="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || printf '未知')"
   [[ ! -e "$QUICK_PATH" && ! -L "$QUICK_PATH" ]] || quick_target="$(readlink -f "$QUICK_PATH" 2>/dev/null || printf '无法解析')"
+  [[ ! -e "$LEGACY_QUICK_PATH" && ! -L "$LEGACY_QUICK_PATH" ]] || legacy_target="$(readlink -f "$LEGACY_QUICK_PATH" 2>/dev/null || printf '无法解析')"
   if command -v curl >/dev/null 2>&1; then
     remote_version="$(curl --proto '=https' --tlsv1.2 -fsSL "${MANAGER_RAW_BASE}/mb-singbox.sh?ts=$(date +%s)" 2>/dev/null | awk -F '"' '/^VERSION="[0-9]/{print $2; exit}')"
     remote_version="${remote_version:-无法获取}"
@@ -3034,10 +3182,11 @@ doctor() {
 
   printf '管理器当前进程：mb-singbox %s\n' "$VERSION"
   printf '固定安装文件：%s（%s）\n' "$INSTALL_PATH" "$installed_version"
-  printf '快捷命令目标：%s -> %s\n' "$QUICK_PATH" "$quick_target"
+  printf '主命令目标：%s -> %s\n' "$QUICK_PATH" "$quick_target"
+  printf '兼容命令目标：%s -> %s\n' "$LEGACY_QUICK_PATH" "$legacy_target"
   printf '安装文件 SHA-256：%s\n' "$installed_hash"
   printf '远端 %s@%s：%s\n' "$MANAGER_REPO" "$MANAGER_REF" "$remote_version"
-  printf 'Sing-box 内核：%s\n' "$(current_core_version 2>/dev/null || printf '未安装')"
+  printf 'sing-box 内核：%s\n' "$(current_core_version 2>/dev/null || printf '未安装')"
   if [[ -s "$STATE_FILE" ]] && state_valid "$STATE_FILE"; then
     printf '状态文件：有效（%s）\n' "$STATE_FILE"
   else
@@ -3045,6 +3194,10 @@ doctor() {
   fi
   service_state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
   printf '服务：%s\n' "${service_state:-未知}"
+  printf '防火墙模式：%s；UFW=%s；firewalld=%s\n' \
+    "$(firewall_mode_label)" \
+    "$(if ufw_is_active; then printf '运行中'; else printf '未运行'; fi)" \
+    "$(if firewalld_is_active; then printf '运行中'; else printf '未运行'; fi)"
   printf '命令解析：\n'
   type -a singbox 2>/dev/null || true
   type -a mb-singbox 2>/dev/null || true
@@ -3052,18 +3205,8 @@ doctor() {
 
 banner() {
   [[ -t 1 ]] && clear || true
-  printf '%s%s' "$C_BOLD" "$C_CYAN"
-  cat <<'EOF'
- __  __  ____        ____  _             _                
-|  \/  || __ )      / ___|(_)_ __   __ _| |__   _____  __
-| |\/| ||  _ \ _____\___ \| | '_ \ / _` | '_ \ / _ \ \/ /
-| |  | || |_) |_____|___) | | | | | (_| | |_) | (_) >  < 
-|_|  |_||____/     |____/|_|_| |_|\__, |_.__/ \___/_/\_\
-                                  |___/                   
-EOF
-  printf '%s' "$C_RESET"
-  printf '%sMB-Singbox %s%s\n' "$C_BOLD" "$VERSION" "$C_RESET"
-  printf '轻量、可校验的 Sing-box 节点管理器\n\n'
+  printf '%s%sMB sing-box 管理器 %s%s\n' "$C_BOLD" "$C_CYAN" "$VERSION" "$C_RESET"
+  printf '轻量、可校验的 sing-box 节点管理器\n\n'
 }
 
 main_menu() {
@@ -3083,7 +3226,7 @@ main_menu() {
     printf '  5. 删除节点\n'
     printf '  6. 服务管理与日志\n'
     printf '  7. Argo 应急隧道（VMess-WS 专属）\n'
-    printf '  8. BBR、UFW 与 AI 检测\n'
+    printf '  8. BBR、防火墙宽松/收紧与 AI 检测\n'
     printf '  9. 修改客户端连接地址\n'
     printf ' 10. 客户端与 VMess/Argo 优选地址\n'
     printf ' 11. 彻底卸载\n'
@@ -3113,17 +3256,17 @@ show_help() {
 ${PROGRAM} ${VERSION}
 
 用法：
-  singbox                    打开交互菜单
-  singbox install-core       安装/更新 Sing-box 最新稳定版
-  singbox install-core VERSION
-  singbox update-manager     更新 MB-Singbox 管理器
-  singbox check              检查当前服务端配置
-  singbox render             重新生成、校验并应用全部配置
-  singbox status             查看状态
-  singbox doctor             检查版本、路径和安装状态
-  singbox version
+  mb-singbox                    打开交互菜单
+  mb-singbox install-core       安装/更新 sing-box 最新稳定版
+  mb-singbox install-core VERSION
+  mb-singbox update-manager     更新 MB sing-box 管理器
+  mb-singbox check              检查当前服务端配置
+  mb-singbox render             重新生成、校验并应用全部配置
+  mb-singbox status             查看状态
+  mb-singbox doctor             检查版本、路径和安装状态
+  mb-singbox version
 
-兼容命令：${PROGRAM}
+兼容命令：singbox
 
 状态文件：${STATE_FILE}
 服务端配置：${SERVER_CONFIG}

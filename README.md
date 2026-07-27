@@ -1,6 +1,8 @@
-# MB-Singbox
+# MB sing-box 管理器
 
-MB-Singbox 是一个面向 systemd Linux VPS 的 Sing-box 节点管理脚本。当前管理器版本：`0.4.2`。
+MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.4.3`。
+
+命名约定：`MB` 只作为项目系列前缀，不另行展开；用户界面统一使用“MB sing-box 管理器”，技术标识统一使用 `mb-singbox`，上游内核统一写作 `sing-box`。主命令是 `mb-singbox`；旧命令 `singbox` 仅作为兼容别名保留。
 
 支持以下服务端节点：
 
@@ -15,7 +17,7 @@ MB-Singbox 是一个面向 systemd Linux VPS 的 Sing-box 节点管理脚本。�
 
 - Debian、Ubuntu、CentOS、Rocky Linux、AlmaLinux 等使用 systemd 的 Linux VPS
 - root 权限
-- Sing-box `1.13.0` 或更高版本
+- sing-box `1.13.0` 或更高版本
 - 创建 Hysteria2、TUIC、AnyTLS、VMess 前，需要准备受系统信任的 TLS 证书
 - 证书建议放在 `/etc/acme/certs/<域名>/`，不要放在 `/root` 或 `/home`
 
@@ -34,8 +36,10 @@ sudo bash /tmp/mb-singbox-install.sh
 安装完成后运行：
 
 ```bash
-sudo singbox
+sudo mb-singbox
 ```
+
+旧命令 `sudo singbox` 仍可使用，但新文档统一使用 `mb-singbox`。
 
 如果从 ZIP 解压安装，可以直接执行：
 
@@ -47,11 +51,12 @@ sudo bash install.sh
 
 ## 首次使用
 
-1. 进入菜单 `1`，安装最新稳定版 Sing-box。
+1. 进入菜单 `1`，安装最新稳定版 sing-box。
 2. 进入菜单 `2`，填写 VPS 公网 IP 或域名并创建节点。
-3. 在 VPS 防火墙和云厂商安全组中放行节点端口。
-4. 进入菜单 `3`，查看分享链接和客户端配置路径。
-5. 把客户端 JSON 下载到对应设备，或扫描二维码导入节点。
+3. 进入菜单 `8 -> 3`，选择防火墙模式。节点机和 Docker 主机可选择宽松模式。
+4. 在云厂商控制台确认安全组没有拦截节点端口。
+5. 进入菜单 `3`，查看分享链接和客户端配置路径。
+6. 把客户端 JSON 下载到对应设备，或扫描二维码导入节点。
 
 ## 默认端口
 
@@ -68,6 +73,18 @@ TCP 和 UDP 是不同的端口空间，所以 `443/TCP` 与 `443/UDP` 可以同�
 
 Argo 的本地源站只监听 `127.0.0.1` 随机高位端口，不需要在 VPS 或安全组中开放本地源站端口。
 
+## 防火墙模式
+
+菜单 `8 -> 3` 提供三种状态：
+
+- **宽松模式**：停用 UFW 和 firewalld，主机端口不再由它们限制。不会清空 `iptables`/`nftables`，会保留 Docker 的 NAT、转发和容器网络规则。
+- **节点端口收紧模式**：使用 UFW 默认拒绝入站，保留已有 UFW 规则，并先放行当前 SSH TCP 端口和全部节点 TCP/UDP 端口。节点增删后自动同步；同步失败时按可用性优先策略自动退回宽松模式，避免节点因端口未放行而失联。
+- **外部管理**：管理器不启用、不停用也不同步防火墙，由用户或其他系统负责。
+
+宽松和收紧都会同时处理防火墙状态与节点端口策略。云厂商安全组独立于 VPS 系统防火墙，脚本无法自动修改；即使选择宽松模式，也要在云平台控制台放行需要的端口。
+
+不要手工执行 `iptables -F` 或 `nft flush ruleset` 来实现全开放，这会破坏 Docker 网络。
+
 ## 菜单
 
 ```text
@@ -78,7 +95,7 @@ Argo 的本地源站只监听 `127.0.0.1` 随机高位端口，不需要在 VPS 
 5.  删除节点
 6.  服务管理与日志
 7.  Argo 应急隧道
-8.  BBR、UFW 与 AI 检测
+8.  BBR、防火墙宽松/收紧与 AI 检测
 9.  修改客户端连接地址
 10. 客户端与 VMess/Argo 优选地址
 11. 彻底卸载
@@ -90,13 +107,13 @@ Argo 的本地源站只监听 `127.0.0.1` 随机高位端口，不需要在 VPS 
 ## 常用命令
 
 ```bash
-sudo singbox version          # 查看管理器版本
-sudo singbox doctor           # 检查版本、安装路径和命令冲突
-sudo singbox status           # 查看服务和节点状态
-sudo singbox check            # 检查服务端配置
-sudo singbox render           # 重新生成并应用全部配置
-sudo singbox update-manager   # 更新管理器
-sudo singbox install-core     # 更新 Sing-box 内核
+sudo mb-singbox version          # 查看管理器版本
+sudo mb-singbox doctor           # 检查版本、安装路径和命令冲突
+sudo mb-singbox status           # 查看服务和节点状态
+sudo mb-singbox check            # 检查服务端配置
+sudo mb-singbox render           # 重新生成并应用全部配置
+sudo mb-singbox update-manager   # 更新管理器
+sudo mb-singbox install-core     # 更新 sing-box 内核
 ```
 
 服务名称是 `mb-singbox.service`：
@@ -118,7 +135,7 @@ journalctl -u mb-singbox -n 50 --no-pager
 
 - Windows TUN：全局接管流量
 - Windows 系统代理：只代理使用系统代理的软件
-- Router TUN：适合直接运行原生 Sing-box 的 Linux/OpenWrt
+- Router TUN：适合直接运行原生 sing-box 的 Linux/OpenWrt
 
 不同 Windows 配置不要同时运行，否则本地端口可能冲突。
 
@@ -137,7 +154,7 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 
 ## 更新与备份
 
-从 `0.3.x` 更新到 `0.4.2` 会保留节点、UUID、密码、Reality 密钥、证书路径和 Argo 配置。
+从 `0.3.x` 或 `0.4.2` 更新到 `0.4.3` 会保留节点、UUID、密码、Reality 密钥、证书路径、Argo 配置和原有 `singbox` 兼容命令。
 
 脚本修改配置前会执行校验并创建备份，默认保留最近 20 份：
 
@@ -152,9 +169,9 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 ### GitHub 已更新，但 VPS 仍显示旧版本
 
 ```bash
-sudo singbox doctor
-type -a singbox mb-singbox
-sudo singbox update-manager
+sudo mb-singbox doctor
+type -a mb-singbox singbox
+sudo mb-singbox update-manager
 ```
 
 `doctor` 会显示当前执行文件、固定安装文件、SHA-256 和远端版本。
@@ -172,8 +189,8 @@ mb-singbox.service
 先运行：
 
 ```bash
-sudo singbox check
-sudo singbox render
+sudo mb-singbox check
+sudo mb-singbox render
 journalctl -u mb-singbox -n 50 --no-pager
 ```
 
