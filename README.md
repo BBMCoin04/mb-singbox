@@ -1,6 +1,6 @@
 # MB-Singbox
 
-面向 systemd Linux VPS 的 Sing-box 节点管理器。当前版本 `0.3.3` 生成可由真实 Sing-box 内核校验的服务端配置、Windows 客户端配置、Linux/OpenWrt 软路由配置、分享链接和二维码。
+面向 systemd Linux VPS 的 Sing-box 节点管理器。当前版本 `0.4.0` 生成可由真实 Sing-box 内核校验的服务端配置、Windows 客户端配置、Linux/OpenWrt 软路由配置、分享链接和二维码。
 
 脚本不捆绑订阅服务器、WARP 或流媒体解锁。状态、服务端配置和客户端配置都保存在 root 专用目录；Reality 私钥不会写入客户端文件、分享链接或二维码。
 
@@ -102,6 +102,8 @@ journalctl -u mb-singbox -n 100 --no-pager
 
 嵌套菜单中的 `0` 均表示返回。节点查看、修改和删除使用编号选择；错误编号会重新询问。
 
+服务菜单将状态与日志分开：状态页不夹带历史日志；最近日志限制为 50 行；实时日志可用 `Ctrl+C` 返回；错误视图只筛选当前 systemd Invocation 中的 `ERROR/WARN/FATAL`。启动、停止、重启和配置检查都会给出明确结果。
+
 ## 配置文件
 
 客户端始终只生成三份汇总 JSON，内容根据当前全部节点自动更新：
@@ -114,13 +116,15 @@ journalctl -u mb-singbox -n 100 --no-pager
 /etc/mb-singbox/clients/sing-box-router-tun.json
 /etc/mb-singbox/links/<节点>.txt
 /etc/mb-singbox/links/<节点>-argo.txt
+/etc/mb-singbox/links/<节点>-argo-preferred.txt
 /etc/mb-singbox/links/all.txt
 /etc/mb-singbox/qrcodes/<节点>.png
 /etc/mb-singbox/qrcodes/<节点>-argo.png
+/etc/mb-singbox/qrcodes/<节点>-argo-preferred.png
 /etc/mb-singbox/backups/
 ```
 
-单节点只生成分享链接和二维码，不生成单独客户端 JSON。节点增加、修改、删除或 Argo 状态变化时，三份总配置会重新生成并逐份校验。目录默认只有 root 可读，因为客户端文件包含节点凭据。
+单节点只生成分享链接和二维码，不生成单独客户端 JSON。节点增加、修改、删除或 Argo 状态变化时，三份总配置会重新生成并逐份校验。Argo 固定域名标准入口始终存在；只有已保存且仍匹配当前域名、端口、路径和候选池的优选结果才会追加 `-argo-preferred`。目录默认只有 root 可读，因为客户端文件包含节点凭据。
 
 ## 客户端配置
 
@@ -170,6 +174,8 @@ journalctl -u mb-singbox -n 100 --no-pager
 
 TUIC v5 的服务端、Sing-box 客户端 JSON 和分享链接统一显式使用 `ALPN h3`。如果客户端发送 `h3` 而服务端未配置相同 ALPN，UDP 数据包虽然会双向传输，但 QUIC/TLS 会在 TUIC 认证前失败。
 
+v2rayN 的延迟结果不是协议认证结论。部分 UDP/QUIC 节点、嵌套软路由、TUN 或 DNS 环境可能显示 `-1`，但真实浏览和服务端 `inbound/<协议>`、`outbound/direct` 日志仍然成功。排障时以实际访问和服务端日志为准，再用直连桌面网络排除软路由干扰。
+
 ## VMess/Argo 与优选 address
 
 普通 Cloudflare Tunnel 不能透明承载 Reality、Hysteria 2、TUIC 或 AnyTLS。脚本只允许 Argo 绑定 VMess-WebSocket 节点，并创建无 TLS 的本地回环源站。
@@ -193,15 +199,15 @@ www.cloudflare.com
 one.one.one.one
 ```
 
-生成配置时会随机抽取最多三个候选，并执行真实 TLS + WebSocket Upgrade 检查。只有在以下条件全部满足时才把候选写入 `address/server`：
+只有在菜单 `10 -> 4` 主动重新实测时，脚本才随机抽取最多三个候选，并执行真实 TLS + WebSocket Upgrade 检查。普通 `render`、节点修改和 Argo 公网验证只复用已保存结果，不联网随机重选。只有在以下条件全部满足时才把候选写入优选入口的 `address/server`：
 
 1. 使用节点自己的 TLS/Argo 域名完成证书和主机名校验。
 2. 通过候选地址连接 VMess 端口：直连/CDN默认 `2087/TCP`，Argo 默认 `2096/TCP`。
 3. 目标 WebSocket 路径返回 HTTP `101 Switching Protocols`。
 
-如果 2087 节点是 DNS-only VPS 直连而不是 Cloudflare 代理入口，候选地址不会通过测试，配置会保留原始 VPS 地址。Argo 候选全部失败时回退到自己的 Argo 域名。脚本不会设置 `allow_insecure`，不会把第三方域名当作 SNI，也不会手工把 `cloudflare-ech.com` 当作普通 TLS SNI。
+如果 2087 节点是 DNS-only VPS 直连而不是 Cloudflare 代理入口，候选地址不会通过测试，配置会保留原始 VPS 地址。Argo 无论优选结果如何都生成固定域名标准入口；优选成功时额外生成独立的 `Argo-Preferred` 入口。两者使用相同固定 SNI 和 WebSocket Host，只有优选入口的连接 Address 不同。脚本不会设置 `allow_insecure`，不会把第三方域名当作 SNI，也不会手工把 `cloudflare-ech.com` 当作普通 TLS SNI。
 
-第三方候选域名的所有者可以随时改变 DNS，因此它们只作为经过当次实测的连接地址。可以在菜单 `10` 中关闭该功能、替换候选池、恢复默认池或重新实测生成配置。
+探测时间、目标域名/端口/路径、尝试列表、最终地址和回退原因保存在 `state.json`。目标配置或候选池变化后，旧结果自动失效并回退标准入口。第三方候选域名的所有者可以随时改变 DNS，因此可以在菜单 `10` 中关闭功能、替换候选池、恢复默认池或按需重新实测。
 
 Named Tunnel 自动配置需要：
 
@@ -221,7 +227,7 @@ API Token 只在当前进程内使用，不写入状态或日志。Tunnel Token 
 /etc/acme/certs/<域名>/key.pem
 ```
 
-证书选择时检查文件存在、OpenSSL 可解析以及证书公钥与私钥匹配。也可以手动输入其他绝对路径。
+证书选择、`singbox check`、服务启动/重启和 `render` 都会检查：文件与 OpenSSL 格式、证书公钥与私钥匹配、证书尚未过期、SAN 覆盖所填 SNI，以及完整链可验证到系统信任根。证书将在 30 天内到期时会警告。也可以手动输入其他绝对路径，但自签名、错误域名、缺失中间证书或系统不信任的链会被拒绝。
 
 证书续期后建议 reload：
 
@@ -266,6 +272,8 @@ sudo singbox status
 sudo singbox update-manager
 ```
 
+从 `0.3.x` 在线更新到 `0.4.0` 时，现有节点、UUID、密码、Reality 密钥、证书路径和固定 Argo 配置保持不变。首次 `render` 会补充新的优选结果字段，并以标准地址生成配置；旧版本没有保存探测元数据，因此需要执行一次菜单 `10 -> 4` 才会新增持久化的优选入口。
+
 节点变更流程：
 
 1. 从状态生成候选服务端配置。
@@ -283,4 +291,4 @@ sudo singbox update-manager
 ./tests/regression.sh 1.13.14
 ```
 
-回归测试会下载并校验官方 Sing-box `1.13.14`，检查服务端、固定三份汇总桌面/软路由配置、现代 DNS/路由字段、默认端口、VMess/Argo address/SNI/Host 分离、分享链接数量以及 Reality 私钥隔离。
+回归测试会下载并校验官方 Sing-box `1.13.14`，检查服务端、固定三份汇总桌面/软路由配置、现代 DNS/路由字段、默认端口、TUIC `ALPN h3`、Argo 标准/优选 address 与固定 SNI/Host 分离、优选结果持久化、证书校验、分享链接数量以及 Reality 私钥隔离。

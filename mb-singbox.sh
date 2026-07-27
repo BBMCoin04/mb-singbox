@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.3.3"
+VERSION="0.4.0"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/singbox}"
@@ -203,7 +203,9 @@ init_state() {
         "cloudflare.182682.xyz",
         "www.cloudflare.com",
         "one.one.one.one"
-      ]
+      ] |
+      .client.preferred_results //= {} |
+      .client.preferred_last_probe_at //= ""
     ' "$STATE_FILE" > "$normalized"
     if ! cmp -s "$STATE_FILE" "$normalized"; then
       install -m 0600 "$normalized" "$STATE_FILE"
@@ -236,7 +238,9 @@ init_state() {
         "cloudflare.182682.xyz",
         "www.cloudflare.com",
         "one.one.one.one"
-      ]
+      ],
+      preferred_results: {},
+      preferred_last_probe_at: ""
     }
   }' > "$STATE_FILE"
   chmod 0600 "$STATE_FILE"
@@ -517,11 +521,11 @@ render_server_config() {
 
 make_outbound_json() {
   local node_json="$1" server_address="$2" argo_hostname="${3:-}"
-  local connect_address="${4:-$argo_hostname}" argo_port="${5:-2096}"
+  local connect_address="${4:-$argo_hostname}" argo_port="${5:-2096}" variant="${6:-}"
   jq -n --argjson n "$node_json" --arg server "$server_address" --arg argo "$argo_hostname" \
-    --arg connect "$connect_address" --argjson argo_port "$argo_port" '
+    --arg connect "$connect_address" --argjson argo_port "$argo_port" --arg variant "$variant" '
     if $argo != "" then {
-      type: "vmess", tag: ("node-" + $n.id + "-argo"), server: $connect, server_port: $argo_port,
+      type: "vmess", tag: ("node-" + $n.id + "-argo" + (if $variant == "" then "" else "-" + $variant end)), server: $connect, server_port: $argo_port,
       connect_timeout: "10s", tcp_fast_open: true,
       uuid: $n.uuid, security: "auto", alter_id: 0, network: "tcp",
       tls: {
@@ -677,8 +681,8 @@ render_client_config() {
 
 node_share_link() {
   local node_json="$1" server="$2" argo_hostname="${3:-}"
-  local connect_address="${4:-$argo_hostname}" argo_port="${5:-2096}"
-  local type name port uri_host uuid password tls_domain path short_id public_key obfs vmess_json
+  local connect_address="${4:-$argo_hostname}" argo_port="${5:-2096}" variant_label="${6:-}"
+  local type name port uri_host uuid password tls_domain path short_id public_key obfs vmess_json profile_name
   type="$(jq -r '.type' <<<"$node_json")"
   name="$(jq -r '.name' <<<"$node_json")"
   port="$(jq -r '.port' <<<"$node_json")"
@@ -687,7 +691,8 @@ node_share_link() {
   if [[ -n "$argo_hostname" ]]; then
     uuid="$(jq -r '.uuid' <<<"$node_json")"
     path="$(jq -r '.path' <<<"$node_json")"
-    vmess_json="$(jq -nc --arg ps "${name}-Argo" --arg add "$connect_address" --arg port "$argo_port" --arg id "$uuid" --arg host "$argo_hostname" --arg path "$path" '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"ws",type:"none",host:$host,path:$path,tls:"tls",sni:$host}')"
+    profile_name="${name}-Argo${variant_label:+-${variant_label}}"
+    vmess_json="$(jq -nc --arg ps "$profile_name" --arg add "$connect_address" --arg port "$argo_port" --arg id "$uuid" --arg host "$argo_hostname" --arg path "$path" '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"ws",type:"none",host:$host,path:$path,tls:"tls",sni:$host}')"
     printf 'vmess://%s\n' "$(printf '%s' "$vmess_json" | base64_nowrap)"
     return 0
   fi
@@ -749,20 +754,32 @@ probe_preferred_address() {
   return 1
 }
 
-select_preferred_address() {
-  local state="$1" hostname="$2" port="$3" path="$4" candidate index attempts=0 fallback
+saved_preferred_address() {
+  local state="$1" key="$2" hostname="$3" port="$4" path="$5" fallback="${6:-}"
+  jq -er --arg key "$key" --arg hostname "$hostname" --argjson port "$port" --arg path "$path" '
+    select(.client.preferred_enabled // true) |
+    (.client.preferred_results[$key] // {}) as $result |
+    select(
+      $result.status == "passed" and
+      $result.hostname == $hostname and
+      $result.port == $port and
+      $result.path == $path and
+      any(.client.preferred_addresses[]?; . == $result.address)
+    ) |
+    $result.address
+  ' "$state" 2>/dev/null || printf '%s' "$fallback"
+}
+
+probe_preferred_target() {
+  local state="$1" hostname="$2" port="$3" path="$4" fallback="$5" checked_at="$6"
+  local candidate index attempts=0 selected="" reason="" attempt_results='[]' passed=false
   local -a candidates=()
-  fallback="${5:-$hostname}"
-  if [[ "${MB_SINGBOX_SKIP_PREFERRED_PROBE:-0}" == "1" ]] ||
-     ! jq -e '.client.preferred_enabled // true' "$state" >/dev/null 2>&1; then
-    printf '%s' "$fallback"
-    return 0
-  fi
   while IFS= read -r candidate; do
     if validate_domain "$candidate" || [[ "$candidate" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
       candidates+=("$candidate")
     fi
   done < <(jq -r '.client.preferred_addresses[]? // empty' "$state")
+
   while (( ${#candidates[@]} > 0 && attempts < 3 )); do
     index=$((RANDOM % ${#candidates[@]}))
     candidate="${candidates[$index]}"
@@ -770,18 +787,82 @@ select_preferred_address() {
     candidates=("${candidates[@]}")
     attempts=$((attempts + 1))
     if probe_preferred_address "$candidate" "$hostname" "$port" "$path"; then
+      attempt_results="$(jq -c --arg address "$candidate" '. + [{address:$address,passed:true}]' <<<"$attempt_results")"
+      selected="$candidate"
+      passed=true
       info "VMess 优选地址已实测通过：${candidate}:${port}（SNI/Host：${hostname}）" >&2
-      printf '%s' "$candidate"
-      return 0
+      break
     fi
+    attempt_results="$(jq -c --arg address "$candidate" '. + [{address:$address,passed:false}]' <<<"$attempt_results")"
   done
-  warn "优选地址候选未通过实测，客户端回退到 ${fallback}:${port}。" >&2
-  printf '%s' "$fallback"
+
+  if [[ "$passed" != "true" ]]; then
+    selected="$fallback"
+    if (( attempts == 0 )); then
+      reason="候选地址池为空"
+    else
+      reason="本次测试的 ${attempts} 个候选均未通过 TLS/WebSocket 校验"
+    fi
+    warn "${reason}，保留标准地址 ${fallback}:${port}。" >&2
+  fi
+
+  jq -nc --arg address "$selected" --arg hostname "$hostname" --argjson port "$port" \
+    --arg path "$path" --arg checked_at "$checked_at" --arg reason "$reason" \
+    --argjson passed "$passed" --argjson attempts "$attempt_results" '{
+      status:(if $passed then "passed" else "fallback" end),
+      address:$address,hostname:$hostname,port:$port,path:$path,
+      checked_at:$checked_at,fallback_reason:$reason,attempts:$attempts
+    }'
+}
+
+refresh_preferred_results() {
+  local candidate next node_json id key hostname port path fallback result checked_at
+  jq -e '.client.preferred_enabled // true' "$STATE_FILE" >/dev/null || {
+    error "优选地址当前已关闭，请先启用。"
+    return 1
+  }
+  candidate="$(mktemp "${ROOT_DIR}/.state-preferred.XXXXXX.json")" || return 1
+  checked_at="$(date -u +%FT%TZ)"
+  jq --arg checked_at "$checked_at" '.client.preferred_results={} | .client.preferred_last_probe_at=$checked_at' "$STATE_FILE" > "$candidate"
+
+  while IFS= read -r node_json; do
+    id="$(jq -r '.id' <<<"$node_json")"
+    key="vmess:${id}"
+    hostname="$(jq -r '.tls_domain' <<<"$node_json")"
+    port="$(jq -r '.port' <<<"$node_json")"
+    path="$(jq -r '.path' <<<"$node_json")"
+    fallback="$(jq -r '.server_address' "$candidate")"
+    result="$(probe_preferred_target "$candidate" "$hostname" "$port" "$path" "$fallback" "$checked_at")" || { rm -f "$candidate"; return 1; }
+    next="${candidate}.next"
+    jq --arg key "$key" --argjson result "$result" '.client.preferred_results[$key]=$result' "$candidate" > "$next"
+    mv "$next" "$candidate"
+  done < <(jq -c '.nodes[] | select(.type == "vmess")' "$candidate")
+
+  if jq -e '.argo.enabled and (.argo.hostname // "") != ""' "$candidate" >/dev/null; then
+    id="$(jq -r '.argo.node_id' "$candidate")"
+    key="argo:${id}"
+    hostname="$(jq -r '.argo.hostname' "$candidate")"
+    port="$(jq -r '.argo.public_port // 2096' "$candidate")"
+    path="$(jq -r --arg id "$id" '.nodes[] | select(.id == $id) | .path' "$candidate")"
+    result="$(probe_preferred_target "$candidate" "$hostname" "$port" "$path" "$hostname" "$checked_at")" || { rm -f "$candidate"; return 1; }
+    next="${candidate}.next"
+    jq --arg key "$key" --argjson result "$result" '.client.preferred_results[$key]=$result' "$candidate" > "$next"
+    mv "$next" "$candidate"
+  fi
+
+  if ! generate_outputs "$candidate"; then
+    rm -f "$candidate"
+    error "优选结果生成的客户端配置未通过校验，原状态保持不变。"
+    return 1
+  fi
+  install -m 0600 "$candidate" "$STATE_FILE"
+  rm -f "$candidate"
+  ok "优选地址结果已保存；普通配置重建将复用本次结果。"
 }
 
 generate_outputs() {
   local state="$1" temp_root server client_server node_json id name link link_file argo_hostname=""
-  local argo_address="" argo_path="" argo_port=2096
+  local preferred_key="" argo_preferred_address="" argo_path="" argo_port=2096
   temp_root="$(mktemp -d "${ROOT_DIR}/.outputs.XXXXXX")" || return 1
   install -d -m 0700 "$temp_root/clients" "$temp_root/links" "$temp_root/qrcodes"
   server="$(jq -r '.server_address' "$state")"
@@ -797,7 +878,8 @@ generate_outputs() {
     name="$(jq -r '.name' <<<"$node_json")"
     client_server="$server"
     if [[ "$(jq -r '.type' <<<"$node_json")" == "vmess" ]]; then
-      client_server="$(select_preferred_address "$state" "$(jq -r '.tls_domain' <<<"$node_json")" "$(jq -r '.port' <<<"$node_json")" "$(jq -r '.path' <<<"$node_json")" "$server")"
+      preferred_key="vmess:${id}"
+      client_server="$(saved_preferred_address "$state" "$preferred_key" "$(jq -r '.tls_domain' <<<"$node_json")" "$(jq -r '.port' <<<"$node_json")" "$(jq -r '.path' <<<"$node_json")" "$server")"
     fi
     link="$(node_share_link "$node_json" "$client_server")"
     link_file="$temp_root/links/${id}.txt"
@@ -819,13 +901,24 @@ generate_outputs() {
       id="$(jq -r '.id' <<<"$node_json")"
       name="$(jq -r '.name' <<<"$node_json")"
       argo_path="$(jq -r '.path' <<<"$node_json")"
-      argo_address="$(select_preferred_address "$state" "$argo_hostname" "$argo_port" "$argo_path")"
-      link="$(node_share_link "$node_json" "$server" "$argo_hostname" "$argo_address" "$argo_port")"
+
+      link="$(node_share_link "$node_json" "$server" "$argo_hostname" "$argo_hostname" "$argo_port")"
       printf '%s\n' "$link" > "$temp_root/links/${id}-argo.txt"
-      printf '%s-Argo\n%s\n\n' "$name" "$link" >> "$temp_root/links/all.txt"
+      printf '%s-Argo-Standard\n%s\n\n' "$name" "$link" >> "$temp_root/links/all.txt"
       command -v qrencode >/dev/null 2>&1 && qrencode -o "$temp_root/qrcodes/${id}-argo.png" -s 6 -m 2 "$link" || true
-      jq --argjson outbound "$(make_outbound_json "$node_json" "$server" "$argo_hostname" "$argo_address" "$argo_port")" '. + [$outbound]' "$temp_root/all-outbounds.json" > "$temp_root/all-outbounds.next"
+      jq --argjson outbound "$(make_outbound_json "$node_json" "$server" "$argo_hostname" "$argo_hostname" "$argo_port")" '. + [$outbound]' "$temp_root/all-outbounds.json" > "$temp_root/all-outbounds.next"
       mv "$temp_root/all-outbounds.next" "$temp_root/all-outbounds.json"
+
+      preferred_key="argo:${id}"
+      argo_preferred_address="$(saved_preferred_address "$state" "$preferred_key" "$argo_hostname" "$argo_port" "$argo_path")"
+      if [[ -n "$argo_preferred_address" && "$argo_preferred_address" != "$argo_hostname" ]]; then
+        link="$(node_share_link "$node_json" "$server" "$argo_hostname" "$argo_preferred_address" "$argo_port" "Preferred")"
+        printf '%s\n' "$link" > "$temp_root/links/${id}-argo-preferred.txt"
+        printf '%s-Argo-Preferred\n%s\n\n' "$name" "$link" >> "$temp_root/links/all.txt"
+        command -v qrencode >/dev/null 2>&1 && qrencode -o "$temp_root/qrcodes/${id}-argo-preferred.png" -s 6 -m 2 "$link" || true
+        jq --argjson outbound "$(make_outbound_json "$node_json" "$server" "$argo_hostname" "$argo_preferred_address" "$argo_port" "preferred")" '. + [$outbound]' "$temp_root/all-outbounds.json" > "$temp_root/all-outbounds.next"
+        mv "$temp_root/all-outbounds.next" "$temp_root/all-outbounds.json"
+      fi
     fi
   fi
 
@@ -873,6 +966,7 @@ apply_candidate_state() {
     error "候选状态格式不正确。"
     return 1
   }
+  validate_state_certificates "$candidate" || return 1
   candidate_config="$(mktemp "${ROOT_DIR}/.server.XXXXXX.json")" || return 1
   render_server_config "$candidate" "$candidate_config" || {
     rm -f "$candidate_config"
@@ -885,7 +979,7 @@ apply_candidate_state() {
     return 1
   fi
   backup="$(backup_current)" || { rm -f "$candidate_config"; return 1; }
-  MB_SINGBOX_SKIP_PREFERRED_PROBE=1 generate_outputs "$candidate" || {
+  generate_outputs "$candidate" || {
     rm -f "$candidate_config"
     error "客户端配置生成失败，不会替换现有状态。"
     return 1
@@ -1055,6 +1149,61 @@ choose_port() {
   done
 }
 
+validate_certificate_bundle() {
+  local domain="$1" cert_file="$2" key_file="$3" leaf_file cert_hash key_hash end_date
+  [[ "$cert_file" == /* && -s "$cert_file" ]] || { error "完整证书链不存在或为空：${cert_file}"; return 1; }
+  [[ "$key_file" == /* && -s "$key_file" ]] || { error "私钥不存在或为空：${key_file}"; return 1; }
+  if ! openssl x509 -in "$cert_file" -noout >/dev/null 2>&1; then
+    error "无法解析证书文件：${cert_file}"
+    return 1
+  fi
+  if ! openssl pkey -in "$key_file" -noout >/dev/null 2>&1; then
+    error "无法解析私钥文件：${key_file}"
+    return 1
+  fi
+
+  cert_hash="$(openssl x509 -in "$cert_file" -pubkey -noout | openssl pkey -pubin -outform der | sha256sum | awk '{print $1}')" || return 1
+  key_hash="$(openssl pkey -in "$key_file" -pubout -outform der | sha256sum | awk '{print $1}')" || return 1
+  if [[ "$cert_hash" != "$key_hash" ]]; then
+    error "${domain} 的证书与私钥不匹配。"
+    return 1
+  fi
+
+  end_date="$(openssl x509 -in "$cert_file" -noout -enddate | cut -d= -f2-)"
+  if ! openssl x509 -in "$cert_file" -noout -checkend 0 >/dev/null 2>&1; then
+    error "${domain} 的证书已经过期：${end_date}"
+    return 1
+  fi
+  if ! openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | grep -q 'DNS:' ||
+     ! openssl x509 -in "$cert_file" -noout -checkhost "$domain" >/dev/null 2>&1; then
+    error "证书 SAN 不包含 SNI 域名 ${domain}。"
+    return 1
+  fi
+
+  leaf_file="$(mktemp /tmp/mb-cert-leaf.XXXXXX.pem)" || return 1
+  awk '/-----BEGIN CERTIFICATE-----/{count++} count==1{print} /-----END CERTIFICATE-----/ && count==1{exit}' "$cert_file" > "$leaf_file"
+  if ! openssl verify -purpose sslserver -untrusted "$cert_file" "$leaf_file" >/dev/null 2>&1; then
+    rm -f "$leaf_file"
+    error "${domain} 的完整证书链无法验证到系统信任根。"
+    return 1
+  fi
+  rm -f "$leaf_file"
+
+  if ! openssl x509 -in "$cert_file" -noout -checkend 2592000 >/dev/null 2>&1; then
+    warn "${domain} 的证书将在 30 天内到期：${end_date}"
+  fi
+}
+
+validate_state_certificates() {
+  local state="$1" item
+  while IFS= read -r item; do
+    validate_certificate_bundle \
+      "$(jq -r '.tls_domain' <<<"$item")" \
+      "$(jq -r '.certificate_path' <<<"$item")" \
+      "$(jq -r '.key_path' <<<"$item")" || return 1
+  done < <(jq -c '[.nodes[] | select(.type != "reality") | {tls_domain,certificate_path,key_path}] | unique[]' "$state")
+}
+
 CERT_DOMAIN=""
 CERT_FILE=""
 KEY_FILE=""
@@ -1097,22 +1246,8 @@ select_certificate() {
     read -r -p "完整证书链绝对路径：" CERT_FILE
     read -r -p "私钥绝对路径：" KEY_FILE
   fi
-  [[ "$CERT_FILE" == /* && -s "$CERT_FILE" ]] || { error "完整证书链不存在或为空。"; return 1; }
-  [[ "$KEY_FILE" == /* && -s "$KEY_FILE" ]] || { error "私钥不存在或为空。"; return 1; }
-  if ! openssl x509 -in "$CERT_FILE" -noout >/dev/null 2>&1; then
-    error "无法解析证书文件。"
-    return 1
-  fi
-  if ! openssl pkey -in "$KEY_FILE" -noout >/dev/null 2>&1; then
-    error "无法解析私钥文件。"
-    return 1
-  fi
-  if [[ "$(openssl x509 -in "$CERT_FILE" -pubkey -noout | openssl pkey -pubin -outform der | sha256sum | awk '{print $1}')" != \
-        "$(openssl pkey -in "$KEY_FILE" -pubout -outform der | sha256sum | awk '{print $1}')" ]]; then
-    error "证书与私钥不匹配。"
-    return 1
-  fi
-  ok "已选择证书：${CERT_DOMAIN}"
+  validate_certificate_bundle "$CERT_DOMAIN" "$CERT_FILE" "$KEY_FILE" || return 1
+  ok "已选择并验证证书：${CERT_DOMAIN}"
 }
 
 read_node_name() {
@@ -1232,7 +1367,7 @@ add_node_menu() {
 }
 
 show_node_result() {
-  local id="$1" node name type port link_file argo_link_file
+  local id="$1" node name type port link_file argo_link_file argo_preferred_link_file
   node="$(jq -c --arg id "$id" '.nodes[] | select(.id == $id)' "$STATE_FILE")"
   [[ -n "$node" ]] || return 1
   name="$(jq -r '.name' <<<"$node")"
@@ -1240,6 +1375,7 @@ show_node_result() {
   port="$(jq -r '.port' <<<"$node")"
   link_file="${LINK_DIR}/${id}.txt"
   argo_link_file="${LINK_DIR}/${id}-argo.txt"
+  argo_preferred_link_file="${LINK_DIR}/${id}-argo-preferred.txt"
   printf '\n%s节点详情%s\n' "$C_BOLD" "$C_RESET"
   printf '名称：%s\n协议：%s\n端口：%s\n' "$name" "$type" "$port"
   printf 'Windows TUN 总配置：%s/sing-box-windows-tun.json\n' "$CLIENT_DIR"
@@ -1254,11 +1390,19 @@ show_node_result() {
     fi
   fi
   if [[ -s "$argo_link_file" ]]; then
-    printf '\nArgo 应急分享链接：\n'
+    printf '\nArgo 标准应急链接（固定域名）：\n'
     cat "$argo_link_file"
     if command -v qrencode >/dev/null 2>&1 && [[ -t 1 ]]; then
       printf '\n'
       qrencode -t ANSIUTF8 -m 1 "$(cat "$argo_link_file")" || true
+    fi
+  fi
+  if [[ -s "$argo_preferred_link_file" ]]; then
+    printf '\nArgo 优选链接（固定 SNI/Host）：\n'
+    cat "$argo_preferred_link_file"
+    if command -v qrencode >/dev/null 2>&1 && [[ -t 1 ]]; then
+      printf '\n'
+      qrencode -t ANSIUTF8 -m 1 "$(cat "$argo_preferred_link_file")" || true
     fi
   fi
 }
@@ -1763,7 +1907,6 @@ set_argo_status() {
   ' "$STATE_FILE" > "$candidate"
   install -m 0600 "$candidate" "$STATE_FILE"
   rm -f "$candidate"
-  generate_outputs "$STATE_FILE"
 }
 
 verify_current_argo() {
@@ -1879,6 +2022,7 @@ configure_argo() {
     fi
   fi
   set_argo_status "$provisioned" "$verified" "$tunnel_id"
+  generate_outputs "$STATE_FILE" || warn "Argo 状态已保存，但客户端配置生成失败。"
   if [[ "$verified" == "true" ]]; then
     ok "Argo 已自动配置并验证可用：${hostname}"
   else
@@ -2097,12 +2241,18 @@ client_settings_menu() {
   while true; do
     printf '\n客户端与 VMess/Argo 优选地址：\n'
     printf '状态：%s\n' "$(jq -r 'if (.client.preferred_enabled // true) then "已启用" else "已关闭" end' "$STATE_FILE")"
-    printf '候选池（每次生成最多随机实测 3 个）：\n'
+    printf '候选池（仅在手动实测时随机检查最多 3 个）：\n'
     jq -r '.client.preferred_addresses[]? | "  - " + .' "$STATE_FILE"
+    if [[ "$(jq -r '.client.preferred_last_probe_at // ""' "$STATE_FILE")" != "" ]]; then
+      printf '上次实测：%s\n' "$(jq -r '.client.preferred_last_probe_at' "$STATE_FILE")"
+      jq -r '.client.preferred_results | to_entries[]? | "  " + .key + "：" + .value.status + "，地址=" + .value.address + (if .value.fallback_reason == "" then "" else "，原因=" + .value.fallback_reason end)' "$STATE_FILE"
+    else
+      printf '上次实测：无\n'
+    fi
     printf '  1. 启用/关闭 VMess/Argo 优选地址\n'
     printf '  2. 替换候选地址池\n'
     printf '  3. 恢复内置候选地址池\n'
-    printf '  4. 重新实测并生成全部客户端配置\n'
+    printf '  4. 重新实测、保存结果并生成客户端配置\n'
     printf '  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
@@ -2133,22 +2283,20 @@ client_settings_menu() {
         fi
         addresses="$(jq -cn --args '$ARGS.positional' "${valid_addresses[@]}")"
         candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-        jq --argjson addresses "$addresses" '.client.preferred_addresses=$addresses' "$STATE_FILE" > "$candidate"
+        jq --argjson addresses "$addresses" '.client.preferred_addresses=$addresses | .client.preferred_results={} | .client.preferred_last_probe_at=""' "$STATE_FILE" > "$candidate"
         save_client_settings "$candidate"
         rm -f "$candidate"
         pause
         ;;
       3)
         candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-        jq '.client.preferred_addresses=["cfip.1323123.xyz","cf.877771.xyz","cloudflare.182682.xyz","www.cloudflare.com","one.one.one.one"]' "$STATE_FILE" > "$candidate"
+        jq '.client.preferred_addresses=["cfip.1323123.xyz","cf.877771.xyz","cloudflare.182682.xyz","www.cloudflare.com","one.one.one.one"] | .client.preferred_results={} | .client.preferred_last_probe_at=""' "$STATE_FILE" > "$candidate"
         save_client_settings "$candidate"
         rm -f "$candidate"
         pause
         ;;
       4)
-        if generate_outputs "$STATE_FILE"; then
-          ok "客户端配置已重新生成：${CLIENT_DIR}"
-        fi
+        refresh_preferred_results
         pause
         ;;
       0) return 0 ;;
@@ -2198,22 +2346,67 @@ regenerate_all_configs() {
 check_configuration() {
   require_core || return 1
   [[ -s "$SERVER_CONFIG" ]] || { error "尚未生成服务端配置。"; return 1; }
+  if [[ -s "$STATE_FILE" ]]; then
+    validate_state_certificates "$STATE_FILE" || return 1
+  fi
   "$SINGBOX_BIN" check -c "$SERVER_CONFIG"
+}
+
+show_current_service_errors() {
+  local invocation logs
+  invocation="$(systemctl show "$SERVICE_NAME" -p InvocationID --value 2>/dev/null || true)"
+  if [[ -z "$invocation" ]]; then
+    warn "当前服务没有可查询的 systemd Invocation ID。"
+    return 0
+  fi
+  logs="$(journalctl -u "$SERVICE_NAME" "_SYSTEMD_INVOCATION_ID=${invocation}" --no-pager 2>/dev/null | grep -E 'ERROR|WARN|FATAL' || true)"
+  if [[ -n "$logs" ]]; then
+    printf '%s\n' "$logs" | tail -n 50
+  else
+    ok "本次服务启动后没有 ERROR/WARN/FATAL 日志。"
+  fi
 }
 
 service_menu() {
   local choice
   while true; do
     printf '\n服务管理：\n'
-    systemctl --no-pager --full status "$SERVICE_NAME" 2>/dev/null | head -n 8 || true
-    printf '  1. 启动\n  2. 停止\n  3. 重启\n  4. 配置检查\n  5. 最近日志\n  0. 返回\n'
+    systemctl --no-pager --full status "$SERVICE_NAME" --lines=0 2>/dev/null || true
+    printf '  1. 启动\n  2. 停止\n  3. 重启\n  4. 配置检查\n  5. 最近 50 行日志\n  6. 实时日志\n  7. 本次启动后的错误日志\n  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
-      1) check_configuration && systemctl enable --now "$SERVICE_NAME" ;;
-      2) systemctl stop "$SERVICE_NAME" ;;
-      3) check_configuration && systemctl restart "$SERVICE_NAME" ;;
-      4) check_configuration ;;
-      5) journalctl -u "$SERVICE_NAME" -n 100 --no-pager ;;
+      1)
+        if check_configuration && systemctl enable --now "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; then
+          ok "${SERVICE_NAME} 已启动并设为开机自启。"
+        else
+          error "${SERVICE_NAME} 启动失败。"
+        fi
+        ;;
+      2)
+        if systemctl stop "$SERVICE_NAME"; then
+          ok "${SERVICE_NAME} 已停止。"
+        else
+          error "${SERVICE_NAME} 停止失败。"
+        fi
+        ;;
+      3)
+        if check_configuration && systemctl restart "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; then
+          ok "${SERVICE_NAME} 已重启并保持运行。"
+        else
+          error "${SERVICE_NAME} 重启失败。"
+        fi
+        ;;
+      4)
+        if check_configuration; then
+          ok "Sing-box 服务端配置检查通过。"
+        fi
+        ;;
+      5) journalctl -u "$SERVICE_NAME" -n 50 --no-pager ;;
+      6)
+        printf '正在跟踪实时日志，按 Ctrl+C 返回菜单。\n'
+        journalctl -u "$SERVICE_NAME" -f --no-pager || true
+        ;;
+      7) show_current_service_errors ;;
       0) return 0 ;;
       *) error "无效选项。" ;;
     esac
