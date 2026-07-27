@@ -4,19 +4,21 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.2.1"
+INSTALLER_VERSION="1.2.2"
 DEFAULT_REPO="BBMCoin04/mb-singbox"
 REPO="${MB_SINGBOX_REPO:-$DEFAULT_REPO}"
 REF="${MB_SINGBOX_REF:-main}"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/singbox}"
-SOURCE_URL="${MB_SINGBOX_SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/mb-singbox.sh}"
+CACHE_BUST="$(date +%s)"
+SOURCE_URL="${MB_SINGBOX_SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/mb-singbox.sh?ts=${CACHE_BUST}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
 BUNDLED_SOURCE=""
 if [[ -z "${MB_SINGBOX_SOURCE_URL+x}" && -n "$SCRIPT_DIR" && -s "${SCRIPT_DIR}/mb-singbox.sh" ]]; then
   BUNDLED_SOURCE="${SCRIPT_DIR}/mb-singbox.sh"
 fi
 TEMP_FILE=""
+BACKUP_FILE=""
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   C_RED=$'\033[31m'
@@ -35,12 +37,21 @@ ok() { printf '%s[完成]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 error() { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 
 cleanup() {
-  [[ -n "$TEMP_FILE" ]] && rm -f "$TEMP_FILE"
+  [[ -z "$TEMP_FILE" ]] || rm -f -- "$TEMP_FILE"
+  [[ -z "$BACKUP_FILE" ]] || rm -f -- "$BACKUP_FILE"
 }
 trap cleanup EXIT HUP INT TERM
 
 if (( EUID != 0 )); then
   error "安装需要 root 权限，请在命令前使用 sudo。"
+  exit 1
+fi
+if [[ "$INSTALL_PATH" != /* || "$(basename "$INSTALL_PATH")" != "mb-singbox" ]]; then
+  error "管理器安装路径必须是绝对路径，并以 mb-singbox 结尾。"
+  exit 1
+fi
+if [[ "$QUICK_PATH" != /* || "$(basename "$QUICK_PATH")" != "singbox" ]]; then
+  error "快捷命令路径必须是绝对路径，并以 singbox 结尾。"
   exit 1
 fi
 
@@ -56,7 +67,7 @@ if [[ -z "$BUNDLED_SOURCE" && "$SOURCE_URL" != https://* ]]; then
 fi
 
 TEMP_FILE="$(mktemp /tmp/mb-singbox.XXXXXX.sh)" || exit 1
-info "MB-Singbox 引导安装器 ${VERSION}"
+info "MB-Singbox 引导安装器 ${INSTALLER_VERSION}"
 if [[ -n "$BUNDLED_SOURCE" ]]; then
   info "正在使用安装包内的 mb-singbox.sh"
   if ! cp "$BUNDLED_SOURCE" "$TEMP_FILE"; then
@@ -93,20 +104,35 @@ if ! grep -q '^PROGRAM="mb-singbox"$' "$TEMP_FILE"; then
   error "下载内容不是预期的 MB-Singbox 主程序，拒绝安装。"
   exit 1
 fi
+MANAGER_VERSION="$(awk -F '"' '/^VERSION="[0-9]/{print $2; exit}' "$TEMP_FILE")"
+if [[ ! "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  error "无法识别管理器版本，拒绝安装。"
+  exit 1
+fi
+info "准备安装 MB-Singbox 管理器 ${MANAGER_VERSION}"
 
 install -d -m 0755 "$(dirname "$INSTALL_PATH")" "$(dirname "$QUICK_PATH")" || {
   error "无法创建管理器安装目录。"
   exit 1
 }
+if [[ -L "$INSTALL_PATH" ]]; then
+  error "安装目标不能是软链接：${INSTALL_PATH}"
+  exit 1
+fi
 if [[ ( -e "$QUICK_PATH" || -L "$QUICK_PATH" ) && "$(readlink -f "$QUICK_PATH" 2>/dev/null || true)" != "$INSTALL_PATH" ]]; then
   error "${QUICK_PATH} 已被其他程序占用，不会覆盖或继续安装。"
   error "请先确认并处理该文件，再重新运行安装器。"
   exit 1
 fi
-install -m 0755 "$TEMP_FILE" "$INSTALL_PATH" || {
-  error "无法安装管理器到 ${INSTALL_PATH}。"
+if [[ -f "$INSTALL_PATH" ]]; then
+  BACKUP_FILE="$(mktemp /tmp/mb-singbox-existing.XXXXXX.sh)" || exit 1
+  cp -a -- "$INSTALL_PATH" "$BACKUP_FILE" || exit 1
+fi
+if ! install -m 0755 "$TEMP_FILE" "$INSTALL_PATH"; then
+  [[ ! -s "$BACKUP_FILE" ]] || install -m 0755 "$BACKUP_FILE" "$INSTALL_PATH" || true
+  error "无法安装管理器到 ${INSTALL_PATH}，已尝试恢复原版本。"
   exit 1
-}
+fi
 if [[ ! -e "$QUICK_PATH" && ! -L "$QUICK_PATH" ]]; then
   ln -s "$INSTALL_PATH" "$QUICK_PATH" || {
     error "无法创建快捷命令 ${QUICK_PATH}。"
@@ -114,12 +140,22 @@ if [[ ! -e "$QUICK_PATH" && ! -L "$QUICK_PATH" ]]; then
   }
 fi
 hash_value="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || true)"
-ok "MB-Singbox 已安装到 ${INSTALL_PATH}"
-ok "快捷命令已创建：${QUICK_PATH} -> ${INSTALL_PATH}"
+if [[ "$("$INSTALL_PATH" version 2>/dev/null)" != "mb-singbox ${MANAGER_VERSION}" ]]; then
+  if [[ -s "$BACKUP_FILE" ]]; then
+    install -m 0755 "$BACKUP_FILE" "$INSTALL_PATH" || true
+  else
+    rm -f -- "$INSTALL_PATH"
+  fi
+  error "安装后的版本自检失败，已恢复原版本。"
+  exit 1
+fi
+ok "MB-Singbox ${MANAGER_VERSION} 已安装到 ${INSTALL_PATH}"
+ok "快捷命令：${QUICK_PATH} -> ${INSTALL_PATH}"
 [[ -n "$hash_value" ]] && printf 'SHA-256: %s\n' "$hash_value"
 
 cleanup
 TEMP_FILE=""
+BACKUP_FILE=""
 trap - EXIT HUP INT TERM
 
 if (( $# > 0 )); then

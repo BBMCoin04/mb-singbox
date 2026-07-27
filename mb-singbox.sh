@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/singbox}"
@@ -32,6 +32,8 @@ ARGO_SERVICE_NAME="mb-singbox-argo.service"
 ARGO_TOKEN_FILE="${ROOT_DIR}/argo-token"
 BBR_FILE="${MB_SINGBOX_BBR_FILE:-/etc/sysctl.d/99-mb-singbox-bbr.conf}"
 LOCK_FILE="${MB_SINGBOX_LOCK_FILE:-/run/lock/mb-singbox.lock}"
+BACKUP_KEEP="${MB_SINGBOX_BACKUP_KEEP:-20}"
+MANAGED_MARKER_NAME=".mb-singbox-managed"
 SELF_PATH="${BASH_SOURCE[0]}"
 if [[ -f "$SELF_PATH" ]]; then
   SELF_PATH="$(readlink -f "$SELF_PATH" 2>/dev/null || printf '%s' "$SELF_PATH")"
@@ -91,9 +93,79 @@ require_systemd() {
   fi
 }
 
+canonical_path() {
+  readlink -m -- "$1" 2>/dev/null
+}
+
+safe_managed_root() {
+  local path canonical
+  path="$1"
+  [[ "$path" == /* && ! "$path" =~ [[:space:]] ]] || return 1
+  canonical="$(canonical_path "$path")" || return 1
+  case "$canonical" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/local|/var|/var/log)
+      return 1
+      ;;
+  esac
+}
+
+path_is_within() {
+  local child parent
+  child="$(canonical_path "$1")" || return 1
+  parent="$(canonical_path "$2")" || return 1
+  [[ "$child" == "$parent"/* ]]
+}
+
+validate_managed_layout() {
+  safe_managed_root "$ROOT_DIR" || { error "拒绝使用危险的状态目录：${ROOT_DIR}"; return 1; }
+  safe_managed_root "$LOG_DIR" || { error "拒绝使用危险的日志目录：${LOG_DIR}"; return 1; }
+  safe_managed_root "$SINGBOX_HOME" || { error "拒绝使用危险的内核目录：${SINGBOX_HOME}"; return 1; }
+  path_is_within "$STATE_FILE" "$ROOT_DIR" || { error "状态文件必须位于 ${ROOT_DIR} 内。"; return 1; }
+  path_is_within "$SERVER_CONFIG" "$ROOT_DIR" || { error "服务端配置必须位于 ${ROOT_DIR} 内。"; return 1; }
+  path_is_within "$CLIENT_DIR" "$ROOT_DIR" || { error "客户端目录必须位于 ${ROOT_DIR} 内。"; return 1; }
+  path_is_within "$LINK_DIR" "$ROOT_DIR" || { error "链接目录必须位于 ${ROOT_DIR} 内。"; return 1; }
+  path_is_within "$QR_DIR" "$ROOT_DIR" || { error "二维码目录必须位于 ${ROOT_DIR} 内。"; return 1; }
+  path_is_within "$BACKUP_DIR" "$ROOT_DIR" || { error "备份目录必须位于 ${ROOT_DIR} 内。"; return 1; }
+  [[ "$(basename "$INSTALL_PATH")" == "mb-singbox" ]] || { error "管理器安装文件名必须是 mb-singbox。"; return 1; }
+  [[ "$(basename "$QUICK_PATH")" == "singbox" ]] || { error "快捷命令文件名必须是 singbox。"; return 1; }
+  [[ "$BACKUP_KEEP" =~ ^[0-9]+$ ]] && (( BACKUP_KEEP >= 1 && BACKUP_KEEP <= 100 )) || {
+    error "MB_SINGBOX_BACKUP_KEEP 必须是 1 到 100。"
+    return 1
+  }
+}
+
+safe_to_remove_managed_root() {
+  local canonical
+  canonical="$(canonical_path "$1")" || return 1
+  safe_managed_root "$canonical" && [[ "$(basename "$canonical")" == "mb-singbox" ]]
+}
+
+write_managed_marker() {
+  local marker="${1}/${MANAGED_MARKER_NAME}"
+  printf 'MB-Singbox managed directory\n' > "$marker" || return 1
+  chmod 0600 "$marker"
+}
+
+managed_marker_valid() {
+  [[ -f "${1}/${MANAGED_MARKER_NAME}" ]] && grep -qx 'MB-Singbox managed directory' "${1}/${MANAGED_MARKER_NAME}"
+}
+
 ensure_directories() {
-  install -d -m 0700 "$ROOT_DIR" "$CLIENT_DIR" "$LINK_DIR" "$QR_DIR" "$BACKUP_DIR" "$LOG_DIR"
-  install -d -m 0755 "$SINGBOX_HOME" "$(dirname "$LOCK_FILE")"
+  validate_managed_layout || return 1
+  install -d -m 0700 "$ROOT_DIR" "$CLIENT_DIR" "$LINK_DIR" "$QR_DIR" "$BACKUP_DIR" "$LOG_DIR" || return 1
+  install -d -m 0755 "$SINGBOX_HOME" "$(dirname "$LOCK_FILE")" || return 1
+  write_managed_marker "$ROOT_DIR" || return 1
+  write_managed_marker "$LOG_DIR" || return 1
+  write_managed_marker "$SINGBOX_HOME" || return 1
+}
+
+atomic_install_file() {
+  local source="$1" target="$2" mode="$3" temporary
+  temporary="$(mktemp "$(dirname "$target")/.$(basename "$target").XXXXXX")" || return 1
+  if ! install -m "$mode" "$source" "$temporary" || ! mv -f -- "$temporary" "$target"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
 }
 
 acquire_lock() {
@@ -117,19 +189,41 @@ validate_port() {
 }
 
 validate_domain() {
-  local domain="${1,,}"
+  local domain="${1,,}" final_label
   (( ${#domain} <= 253 )) || return 1
   [[ "$domain" == *.* ]] || return 1
+  final_label="${domain##*.}"
+  [[ "$final_label" == *[a-z]* ]] || return 1
   [[ "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+
+validate_ipv4() {
+  local value="$1" octet
+  local -a octets=()
+  IFS='.' read -r -a octets <<< "$value"
+  (( ${#octets[@]} == 4 )) || return 1
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^[0-9]{1,3}$ ]] && (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+validate_ipv6() {
+  local value="$1"
+  [[ "$value" == *:* && "$value" != *'%'* ]] || return 1
+  getent ahostsv6 "$value" >/dev/null 2>&1
 }
 
 validate_host() {
   local host="$1"
-  validate_domain "$host" || [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || [[ "$host" == *:* ]]
+  validate_domain "$host" || validate_ipv4 "$host" || validate_ipv6 "$host"
 }
 
 validate_name() {
-  [[ -n "$1" && ${#1} -le 48 && "$1" != *$'\n'* && "$1" != *$'\r'* ]]
+  [[ -n "$1" && ${#1} -le 48 && ! "$1" =~ [[:cntrl:]] ]]
+}
+
+validate_websocket_path() {
+  [[ "$1" =~ ^/[A-Za-z0-9._~!$\&\'\(\)\*+,\;=:@%/-]+$ ]]
 }
 
 safe_id() {
@@ -172,31 +266,99 @@ format_uri_host() {
 }
 
 state_valid() {
+  local state="$1" server address item domain path
   jq -e '
+    def text: type == "string";
+    def nonempty: text and length > 0;
+    def port: type == "number" and . == floor and . >= 1 and . <= 65535;
+    def safe_name: nonempty and length <= 48 and (test("[\u0000-\u001f\u007f]") | not);
+    def common_node:
+      type == "object" and
+      (.id | nonempty and test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+      (.name | safe_name) and
+      (.port | port);
+    def tls_node:
+      (.tls_domain | nonempty) and
+      (.certificate_path | nonempty and startswith("/")) and
+      (.key_path | nonempty and startswith("/"));
+    def valid_node:
+      common_node and
+      if .type == "reality" then
+        (.uuid | nonempty) and (.server_name | nonempty) and
+        (.private_key | nonempty) and (.public_key | nonempty) and (.short_id | nonempty)
+      elif .type == "hysteria2" then
+        tls_node and (.password | nonempty) and (.obfs_password | nonempty)
+      elif .type == "tuic" then
+        tls_node and (.uuid | nonempty) and (.password | nonempty)
+      elif .type == "anytls" then
+        tls_node and (.password | nonempty)
+      elif .type == "vmess" then
+        tls_node and (.uuid | nonempty) and (.path | nonempty and startswith("/"))
+      else false
+      end;
+    . as $root |
     .schema == 1 and
-    (.server_address | type == "string") and
-    (.nodes | type == "array") and
+    (.server_address | text) and
+    (.firewall_managed | type == "boolean") and
+    (.nodes | type == "array" and all(.[]; valid_node)) and
+    (([.nodes[].id] | length) == ([.nodes[].id] | unique | length)) and
+    (([.nodes[] | ((if .type == "hysteria2" or .type == "tuic" then "udp:" else "tcp:" end) + (.port | tostring))] | length) ==
+     ([.nodes[] | ((if .type == "hysteria2" or .type == "tuic" then "udp:" else "tcp:" end) + (.port | tostring))] | unique | length)) and
     (.argo | type == "object") and
-    (.firewall_managed | type == "boolean")
-  ' "$1" >/dev/null 2>&1
+    (.argo.enabled | type == "boolean") and
+    (.argo.mode | text) and (.argo.node_id | text) and (.argo.hostname | text) and
+    (.argo.origin_port | type == "number" and . == floor and . >= 0 and . <= 65535) and
+    ((.argo.provisioned // false) | type == "boolean") and
+    ((.argo.verified // false) | type == "boolean") and
+    ((.argo.tunnel_id // "") | text) and
+    ((.argo.public_port // 2096) | port) and
+    (if .argo.enabled then
+      .argo.origin_port > 0 and any(.nodes[]; .id == $root.argo.node_id and .type == "vmess")
+     else true end) and
+    ((has("client") | not) or .client == null or
+      ((.client | type == "object") and
+       ((.client | has("preferred_enabled") | not) or (.client.preferred_enabled | type == "boolean")) and
+       ((.client.preferred_addresses // []) | type == "array" and all(.[]; nonempty)) and
+       ((.client.preferred_results // {}) | type == "object") and
+       ((.client.preferred_last_probe_at // "") | text)))
+  ' "$state" >/dev/null 2>&1 || return 1
+
+  server="$(jq -r '.server_address' "$state")" || return 1
+  [[ -z "$server" ]] || validate_host "$server" || return 1
+  while IFS=$'\t' read -r item domain path; do
+    case "$item" in
+      reality) validate_domain "$domain" || return 1 ;;
+      tls) validate_domain "$domain" || return 1 ;;
+      vmess) validate_domain "$domain" && validate_websocket_path "$path" || return 1 ;;
+    esac
+  done < <(jq -r '.nodes[] | if .type == "reality" then ["reality",.server_name,""] elif .type == "vmess" then ["vmess",.tls_domain,.path] else ["tls",.tls_domain,""] end | @tsv' "$state")
+  while IFS= read -r address; do
+    [[ -z "$address" ]] || validate_domain "$address" || validate_ipv4 "$address" || return 1
+  done < <(jq -r '.client.preferred_addresses[]? // empty' "$state")
+  address="$(jq -r '.argo.hostname // ""' "$state")" || return 1
+  [[ -z "$address" ]] || validate_domain "$address"
 }
 
 init_state() {
-  ensure_directories
-  if [[ -s "$STATE_FILE" ]]; then
+  local normalized
+  ensure_directories || return 1
+  if [[ -e "$STATE_FILE" ]]; then
+    [[ -s "$STATE_FILE" ]] || {
+      error "状态文件为空，拒绝自动覆盖：${STATE_FILE}"
+      return 1
+    }
     state_valid "$STATE_FILE" || {
       error "状态文件格式不正确：${STATE_FILE}"
       return 1
     }
-    local normalized
     normalized="$(mktemp "${ROOT_DIR}/.state-normalize.XXXXXX.json")" || return 1
-    jq '
+    if ! jq '
       .argo.provisioned //= false |
       .argo.verified //= false |
       .argo.tunnel_id //= "" |
       .argo.public_port //= 2096 |
       .client //= {} |
-      .client.preferred_enabled //= true |
+      .client.preferred_enabled = (if (.client | has("preferred_enabled")) then .client.preferred_enabled else true end) |
       .client.preferred_addresses //= [
         "cfip.1323123.xyz",
         "cf.877771.xyz",
@@ -206,14 +368,22 @@ init_state() {
       ] |
       .client.preferred_results //= {} |
       .client.preferred_last_probe_at //= ""
-    ' "$STATE_FILE" > "$normalized"
-    if ! cmp -s "$STATE_FILE" "$normalized"; then
-      install -m 0600 "$normalized" "$STATE_FILE"
+    ' "$STATE_FILE" > "$normalized" || ! state_valid "$normalized"; then
+      rm -f -- "$normalized"
+      error "状态迁移失败，原文件保持不变：${STATE_FILE}"
+      return 1
     fi
-    rm -f "$normalized"
+    if ! cmp -s "$STATE_FILE" "$normalized" && ! atomic_install_file "$normalized" "$STATE_FILE" 0600; then
+      rm -f -- "$normalized"
+      error "无法原子更新状态文件，原文件保持不变。"
+      return 1
+    fi
+    rm -f -- "$normalized"
     return 0
   fi
-  jq -n --arg now "$(date -u +%FT%TZ)" '{
+
+  normalized="$(mktemp "${ROOT_DIR}/.state-initial.XXXXXX.json")" || return 1
+  if ! jq -n --arg now "$(date -u +%FT%TZ)" '{
     schema: 1,
     server_address: "",
     created_at: $now,
@@ -242,36 +412,58 @@ init_state() {
       preferred_results: {},
       preferred_last_probe_at: ""
     }
-  }' > "$STATE_FILE"
-  chmod 0600 "$STATE_FILE"
+  }' > "$normalized" || ! state_valid "$normalized" || ! atomic_install_file "$normalized" "$STATE_FILE" 0600; then
+    rm -f -- "$normalized"
+    error "无法创建初始状态文件。"
+    return 1
+  fi
+  rm -f -- "$normalized"
 }
 
 install_dependencies() {
-  local missing=() command_name
-  for command_name in curl jq openssl tar flock ss; do
+  local missing=() command_name package_manager=""
+  for command_name in curl jq openssl tar flock ss getent; do
     command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
   done
-  command -v qrencode >/dev/null 2>&1 || missing+=("qrencode")
-  (( ${#missing[@]} == 0 )) && return 0
+  (( ${#missing[@]} == 0 )) || warn "缺少必要命令：${missing[*]}，准备安装依赖。"
 
-  warn "缺少必要命令：${missing[*]}，准备安装依赖。"
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl jq openssl tar util-linux iproute2 qrencode
+  if (( ${#missing[@]} > 0 )); then
+    if command -v apt-get >/dev/null 2>&1; then
+      package_manager=apt
+      apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl jq openssl tar util-linux iproute2 libc-bin
+    elif command -v dnf >/dev/null 2>&1; then
+      package_manager=dnf
+      dnf install -y ca-certificates curl jq openssl tar util-linux iproute glibc-common
+    elif command -v yum >/dev/null 2>&1; then
+      package_manager=yum
+      yum install -y ca-certificates curl jq openssl tar util-linux iproute glibc-common
+    else
+      error "无法识别受支持的包管理器，请手动安装：curl jq openssl tar util-linux iproute2 getent"
+      return 1
+    fi || return 1
+  elif command -v apt-get >/dev/null 2>&1; then
+    package_manager=apt
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ca-certificates curl jq openssl tar util-linux iproute qrencode
+    package_manager=dnf
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y ca-certificates curl jq openssl tar util-linux iproute qrencode
-  else
-    error "无法识别受支持的包管理器，请手动安装：curl jq openssl tar util-linux iproute2 qrencode"
-    return 1
+    package_manager=yum
   fi
 
-  for command_name in curl jq openssl tar flock ss qrencode; do
+  for command_name in curl jq openssl tar flock ss getent; do
     command -v "$command_name" >/dev/null 2>&1 || {
       error "安装依赖后仍缺少命令：${command_name}"
       return 1
     }
   done
+
+  if ! command -v qrencode >/dev/null 2>&1; then
+    case "$package_manager" in
+      apt) DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode >/dev/null 2>&1 || true ;;
+      dnf) dnf install -y qrencode >/dev/null 2>&1 || true ;;
+      yum) yum install -y qrencode >/dev/null 2>&1 || true ;;
+    esac
+    command -v qrencode >/dev/null 2>&1 || warn "未安装 qrencode，将跳过二维码生成，其他功能不受影响。"
+  fi
 }
 
 core_arch() {
@@ -360,7 +552,9 @@ download_core() {
 }
 
 write_service_file() {
-  cat > "$SERVICE_FILE" <<EOF
+  local temporary
+  temporary="$(mktemp /tmp/mb-singbox-service.XXXXXX)" || return 1
+  cat > "$temporary" <<EOF
 [Unit]
 Description=MB-Singbox managed proxy service
 Wants=network-online.target
@@ -390,12 +584,26 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 [Install]
 WantedBy=multi-user.target
 EOF
-  chmod 0644 "$SERVICE_FILE"
+  if ! atomic_install_file "$temporary" "$SERVICE_FILE" 0644; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  rm -f -- "$temporary"
   systemctl daemon-reload
 }
 
+restore_core_binary() {
+  local backup="$1"
+  if [[ -n "$backup" && -x "$backup" ]]; then
+    atomic_install_file "$backup" "$SINGBOX_BIN" 0755
+  else
+    rm -f -- "$SINGBOX_BIN"
+  fi
+}
+
 install_or_update_core() {
-  local requested="${1:-}" current="" extracted candidate version backup=""
+  local requested="${1:-}" current="" extracted version backup="" temp_root
+  local service_was_active=0
   require_root
   require_systemd || return 1
   install_dependencies || return 1
@@ -403,46 +611,58 @@ install_or_update_core() {
   acquire_lock || return 1
 
   current="$(current_core_version 2>/dev/null || true)"
+  systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && service_was_active=1
   extracted="$(download_core "$requested")" || return 1
+  temp_root="$(dirname "$(dirname "$extracted")")"
   version="$($extracted version 2>/dev/null | awk '/sing-box version/ {print $3; exit}')"
   [[ -n "$version" ]] || {
-    rm -rf "$(dirname "$(dirname "$extracted")")"
+    rm -rf -- "$temp_root"
     error "无法读取下载内核的版本。"
     return 1
   }
   if [[ "$(printf '%s\n' "1.13.0" "$version" | sort -V | head -n 1)" != "1.13.0" ]]; then
-    rm -rf "$(dirname "$(dirname "$extracted")")"
+    rm -rf -- "$temp_root"
     error "MB-Singbox ${VERSION} 最低支持 Sing-box 1.13.0，拒绝安装 ${version}。"
     return 1
   fi
 
   if [[ -s "$SERVER_CONFIG" ]] && ! "$extracted" check -c "$SERVER_CONFIG"; then
-    rm -rf "$(dirname "$(dirname "$extracted")")"
+    rm -rf -- "$temp_root"
     error "现有服务端配置未通过 Sing-box ${version} 检查，不会更新内核。"
     return 1
   fi
 
-  ensure_directories
+  ensure_directories || { rm -rf -- "$temp_root"; return 1; }
   if [[ -x "$SINGBOX_BIN" ]]; then
-    backup="${SINGBOX_HOME}/sing-box.previous"
-    cp -a "$SINGBOX_BIN" "$backup"
+    backup="$(mktemp "${SINGBOX_HOME}/.sing-box.previous.XXXXXX")" || { rm -rf -- "$temp_root"; return 1; }
+    cp -a -- "$SINGBOX_BIN" "$backup" || { rm -f -- "$backup"; rm -rf -- "$temp_root"; return 1; }
   fi
-  install -m 0755 "$extracted" "$SINGBOX_BIN"
-  rm -rf "$(dirname "$(dirname "$extracted")")"
-  write_service_file || return 1
+  if ! atomic_install_file "$extracted" "$SINGBOX_BIN" 0755; then
+    rm -f -- "$backup"
+    rm -rf -- "$temp_root"
+    error "无法原子安装 Sing-box 内核。"
+    return 1
+  fi
+  rm -rf -- "$temp_root"
+  if ! write_service_file; then
+    restore_core_binary "$backup" || true
+    rm -f -- "$backup"
+    error "systemd 服务文件更新失败，已恢复旧内核。"
+    return 1
+  fi
 
-  if [[ -s "$SERVER_CONFIG" ]]; then
-    if ! systemctl restart "$SERVICE_NAME"; then
-      if [[ -n "$backup" && -x "$backup" ]]; then
-        install -m 0755 "$backup" "$SINGBOX_BIN"
-        systemctl restart "$SERVICE_NAME" || true
-      fi
-      error "新内核启动失败，已尝试恢复旧内核。"
+  if [[ -s "$SERVER_CONFIG" && "$service_was_active" == "1" ]]; then
+    if ! systemctl restart "$SERVICE_NAME" || ! systemctl is-active --quiet "$SERVICE_NAME"; then
+      restore_core_binary "$backup" || true
+      systemctl restart "$SERVICE_NAME" || true
+      rm -f -- "$backup"
+      error "新内核启动失败，已恢复旧内核。"
       return 1
     fi
-    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  elif [[ -s "$SERVER_CONFIG" ]]; then
+    info "服务更新前处于停止状态，本次不会自动启动。"
   fi
-  rm -f "${SINGBOX_HOME}/sing-box.previous"
+  rm -f -- "$backup"
   ok "Sing-box ${version} 已安装到 ${SINGBOX_BIN}"
   [[ -n "$current" ]] && info "更新前版本：${current}"
 }
@@ -757,7 +977,7 @@ probe_preferred_address() {
 saved_preferred_address() {
   local state="$1" key="$2" hostname="$3" port="$4" path="$5" fallback="${6:-}"
   jq -er --arg key "$key" --arg hostname "$hostname" --argjson port "$port" --arg path "$path" '
-    select(.client.preferred_enabled // true) |
+    select(.client.preferred_enabled != false) |
     (.client.preferred_results[$key] // {}) as $result |
     select(
       $result.status == "passed" and
@@ -775,7 +995,7 @@ probe_preferred_target() {
   local candidate index attempts=0 selected="" reason="" attempt_results='[]' passed=false
   local -a candidates=()
   while IFS= read -r candidate; do
-    if validate_domain "$candidate" || [[ "$candidate" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    if validate_domain "$candidate" || validate_ipv4 "$candidate"; then
       candidates+=("$candidate")
     fi
   done < <(jq -r '.client.preferred_addresses[]? // empty' "$state")
@@ -817,13 +1037,16 @@ probe_preferred_target() {
 
 refresh_preferred_results() {
   local candidate next node_json id key hostname port path fallback result checked_at
-  jq -e '.client.preferred_enabled // true' "$STATE_FILE" >/dev/null || {
+  jq -e '.client.preferred_enabled != false' "$STATE_FILE" >/dev/null || {
     error "优选地址当前已关闭，请先启用。"
     return 1
   }
   candidate="$(mktemp "${ROOT_DIR}/.state-preferred.XXXXXX.json")" || return 1
   checked_at="$(date -u +%FT%TZ)"
-  jq --arg checked_at "$checked_at" '.client.preferred_results={} | .client.preferred_last_probe_at=$checked_at' "$STATE_FILE" > "$candidate"
+  if ! jq --arg checked_at "$checked_at" '.client.preferred_results={} | .client.preferred_last_probe_at=$checked_at' "$STATE_FILE" > "$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
 
   while IFS= read -r node_json; do
     id="$(jq -r '.id' <<<"$node_json")"
@@ -832,10 +1055,12 @@ refresh_preferred_results() {
     port="$(jq -r '.port' <<<"$node_json")"
     path="$(jq -r '.path' <<<"$node_json")"
     fallback="$(jq -r '.server_address' "$candidate")"
-    result="$(probe_preferred_target "$candidate" "$hostname" "$port" "$path" "$fallback" "$checked_at")" || { rm -f "$candidate"; return 1; }
+    result="$(probe_preferred_target "$candidate" "$hostname" "$port" "$path" "$fallback" "$checked_at")" || { rm -f -- "$candidate"; return 1; }
     next="${candidate}.next"
-    jq --arg key "$key" --argjson result "$result" '.client.preferred_results[$key]=$result' "$candidate" > "$next"
-    mv "$next" "$candidate"
+    if ! jq --arg key "$key" --argjson result "$result" '.client.preferred_results[$key]=$result' "$candidate" > "$next" || ! mv -f -- "$next" "$candidate"; then
+      rm -f -- "$candidate" "$next"
+      return 1
+    fi
   done < <(jq -c '.nodes[] | select(.type == "vmess")' "$candidate")
 
   if jq -e '.argo.enabled and (.argo.hostname // "") != ""' "$candidate" >/dev/null; then
@@ -844,27 +1069,73 @@ refresh_preferred_results() {
     hostname="$(jq -r '.argo.hostname' "$candidate")"
     port="$(jq -r '.argo.public_port // 2096' "$candidate")"
     path="$(jq -r --arg id "$id" '.nodes[] | select(.id == $id) | .path' "$candidate")"
-    result="$(probe_preferred_target "$candidate" "$hostname" "$port" "$path" "$hostname" "$checked_at")" || { rm -f "$candidate"; return 1; }
+    result="$(probe_preferred_target "$candidate" "$hostname" "$port" "$path" "$hostname" "$checked_at")" || { rm -f -- "$candidate"; return 1; }
     next="${candidate}.next"
-    jq --arg key "$key" --argjson result "$result" '.client.preferred_results[$key]=$result' "$candidate" > "$next"
-    mv "$next" "$candidate"
+    if ! jq --arg key "$key" --argjson result "$result" '.client.preferred_results[$key]=$result' "$candidate" > "$next" || ! mv -f -- "$next" "$candidate"; then
+      rm -f -- "$candidate" "$next"
+      return 1
+    fi
   fi
 
-  if ! generate_outputs "$candidate"; then
-    rm -f "$candidate"
-    error "优选结果生成的客户端配置未通过校验，原状态保持不变。"
+  if ! state_valid "$candidate" || ! generate_outputs "$candidate" || ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
+    rm -f -- "$candidate"
+    generate_outputs "$STATE_FILE" >/dev/null 2>&1 || true
+    error "优选结果保存失败，原状态保持不变。"
     return 1
   fi
-  install -m 0600 "$candidate" "$STATE_FILE"
-  rm -f "$candidate"
+  rm -f -- "$candidate"
   ok "优选地址结果已保存；普通配置重建将复用本次结果。"
 }
 
+swap_generated_outputs() {
+  local temp_root="$1" suffix index rollback_index
+  local -a sources destinations old_paths had_old
+  suffix="rollback.${BASHPID}.${RANDOM}"
+  sources=("$temp_root/clients" "$temp_root/links" "$temp_root/qrcodes")
+  destinations=("$CLIENT_DIR" "$LINK_DIR" "$QR_DIR")
+  old_paths=("${CLIENT_DIR}.${suffix}" "${LINK_DIR}.${suffix}" "${QR_DIR}.${suffix}")
+  had_old=(0 0 0)
+
+  for index in 0 1 2; do
+    if [[ -e "${destinations[$index]}" ]]; then
+      if ! mv -- "${destinations[$index]}" "${old_paths[$index]}"; then
+        for (( rollback_index = index - 1; rollback_index >= 0; rollback_index-- )); do
+          if (( had_old[rollback_index] )); then
+            mv -- "${old_paths[$rollback_index]}" "${destinations[$rollback_index]}" || true
+          fi
+        done
+        return 1
+      fi
+      had_old[$index]=1
+    fi
+  done
+
+  for index in 0 1 2; do
+    if ! mv -- "${sources[$index]}" "${destinations[$index]}"; then
+      for (( rollback_index = 0; rollback_index < index; rollback_index++ )); do
+        rm -rf -- "${destinations[$rollback_index]}"
+      done
+      for rollback_index in 0 1 2; do
+        if (( had_old[rollback_index] )); then
+          mv -- "${old_paths[$rollback_index]}" "${destinations[$rollback_index]}" || true
+        fi
+      done
+      return 1
+    fi
+  done
+  rm -rf -- "${old_paths[@]}"
+}
+
 generate_outputs() {
-  local state="$1" temp_root server client_server node_json id name link link_file argo_hostname=""
+  local state="$1" temp_root server client_server node_json id name link link_file argo_hostname="" outbound
   local preferred_key="" argo_preferred_address="" argo_path="" argo_port=2096
+  ensure_directories || return 1
+  state_valid "$state" || { error "拒绝从无效状态生成客户端配置。"; return 1; }
   temp_root="$(mktemp -d "${ROOT_DIR}/.outputs.XXXXXX")" || return 1
-  install -d -m 0700 "$temp_root/clients" "$temp_root/links" "$temp_root/qrcodes"
+  if ! install -d -m 0700 "$temp_root/clients" "$temp_root/links" "$temp_root/qrcodes"; then
+    rm -rf -- "$temp_root"
+    return 1
+  fi
   server="$(jq -r '.server_address' "$state")"
   if [[ -z "$server" && "$(jq '.nodes|length' "$state")" -gt 0 ]]; then
     rm -rf "$temp_root"
@@ -872,7 +1143,7 @@ generate_outputs() {
     return 1
   fi
 
-  printf '[]\n' > "$temp_root/all-outbounds.json"
+  printf '[]\n' > "$temp_root/all-outbounds.json" || { rm -rf -- "$temp_root"; return 1; }
   while IFS= read -r node_json; do
     id="$(jq -r '.id' <<<"$node_json")"
     name="$(jq -r '.name' <<<"$node_json")"
@@ -889,8 +1160,12 @@ generate_outputs() {
     if command -v qrencode >/dev/null 2>&1; then
       qrencode -o "$temp_root/qrcodes/${id}.png" -s 6 -m 2 "$link" || true
     fi
-    jq --argjson outbound "$(make_outbound_json "$node_json" "$client_server")" '. + [$outbound]' "$temp_root/all-outbounds.json" > "$temp_root/all-outbounds.next"
-    mv "$temp_root/all-outbounds.next" "$temp_root/all-outbounds.json"
+    outbound="$(make_outbound_json "$node_json" "$client_server")" || { rm -rf -- "$temp_root"; return 1; }
+    if ! jq --argjson outbound "$outbound" '. + [$outbound]' "$temp_root/all-outbounds.json" > "$temp_root/all-outbounds.next" ||
+       ! mv -f -- "$temp_root/all-outbounds.next" "$temp_root/all-outbounds.json"; then
+      rm -rf -- "$temp_root"
+      return 1
+    fi
   done < <(jq -c '.nodes[]' "$state")
 
   if jq -e '.argo.enabled and (.argo.hostname != "")' "$state" >/dev/null; then
@@ -906,8 +1181,12 @@ generate_outputs() {
       printf '%s\n' "$link" > "$temp_root/links/${id}-argo.txt"
       printf '%s-Argo-Standard\n%s\n\n' "$name" "$link" >> "$temp_root/links/all.txt"
       command -v qrencode >/dev/null 2>&1 && qrencode -o "$temp_root/qrcodes/${id}-argo.png" -s 6 -m 2 "$link" || true
-      jq --argjson outbound "$(make_outbound_json "$node_json" "$server" "$argo_hostname" "$argo_hostname" "$argo_port")" '. + [$outbound]' "$temp_root/all-outbounds.json" > "$temp_root/all-outbounds.next"
-      mv "$temp_root/all-outbounds.next" "$temp_root/all-outbounds.json"
+      outbound="$(make_outbound_json "$node_json" "$server" "$argo_hostname" "$argo_hostname" "$argo_port")" || { rm -rf -- "$temp_root"; return 1; }
+      if ! jq --argjson outbound "$outbound" '. + [$outbound]' "$temp_root/all-outbounds.json" > "$temp_root/all-outbounds.next" ||
+         ! mv -f -- "$temp_root/all-outbounds.next" "$temp_root/all-outbounds.json"; then
+        rm -rf -- "$temp_root"
+        return 1
+      fi
 
       preferred_key="argo:${id}"
       argo_preferred_address="$(saved_preferred_address "$state" "$preferred_key" "$argo_hostname" "$argo_port" "$argo_path")"
@@ -916,8 +1195,12 @@ generate_outputs() {
         printf '%s\n' "$link" > "$temp_root/links/${id}-argo-preferred.txt"
         printf '%s-Argo-Preferred\n%s\n\n' "$name" "$link" >> "$temp_root/links/all.txt"
         command -v qrencode >/dev/null 2>&1 && qrencode -o "$temp_root/qrcodes/${id}-argo-preferred.png" -s 6 -m 2 "$link" || true
-        jq --argjson outbound "$(make_outbound_json "$node_json" "$server" "$argo_hostname" "$argo_preferred_address" "$argo_port" "preferred")" '. + [$outbound]' "$temp_root/all-outbounds.json" > "$temp_root/all-outbounds.next"
-        mv "$temp_root/all-outbounds.next" "$temp_root/all-outbounds.json"
+        outbound="$(make_outbound_json "$node_json" "$server" "$argo_hostname" "$argo_preferred_address" "$argo_port" "preferred")" || { rm -rf -- "$temp_root"; return 1; }
+        if ! jq --argjson outbound "$outbound" '. + [$outbound]' "$temp_root/all-outbounds.json" > "$temp_root/all-outbounds.next" ||
+           ! mv -f -- "$temp_root/all-outbounds.next" "$temp_root/all-outbounds.json"; then
+          rm -rf -- "$temp_root"
+          return 1
+        fi
       fi
     fi
   fi
@@ -938,29 +1221,68 @@ generate_outputs() {
     fi
   done < <(find "$temp_root/clients" -type f -name '*.json' -print)
 
-  rm -rf "${CLIENT_DIR}.old" "${LINK_DIR}.old" "${QR_DIR}.old"
-  [[ -d "$CLIENT_DIR" ]] && mv "$CLIENT_DIR" "${CLIENT_DIR}.old"
-  [[ -d "$LINK_DIR" ]] && mv "$LINK_DIR" "${LINK_DIR}.old"
-  [[ -d "$QR_DIR" ]] && mv "$QR_DIR" "${QR_DIR}.old"
-  mv "$temp_root/clients" "$CLIENT_DIR"
-  mv "$temp_root/links" "$LINK_DIR"
-  mv "$temp_root/qrcodes" "$QR_DIR"
-  rm -rf "$temp_root" "${CLIENT_DIR}.old" "${LINK_DIR}.old" "${QR_DIR}.old"
-  chmod -R go-rwx "$CLIENT_DIR" "$LINK_DIR" "$QR_DIR"
+  if ! chmod -R go-rwx "$temp_root/clients" "$temp_root/links" "$temp_root/qrcodes" ||
+     ! swap_generated_outputs "$temp_root"; then
+    rm -rf -- "$temp_root"
+    error "客户端输出替换失败，已恢复原目录。"
+    return 1
+  fi
+  rm -rf -- "$temp_root"
 }
 
 backup_current() {
-  local stamp target
-  stamp="$(date +%Y%m%d-%H%M%S)"
-  target="${BACKUP_DIR}/${stamp}"
-  install -d -m 0700 "$target"
-  [[ -s "$STATE_FILE" ]] && cp -a "$STATE_FILE" "$target/state.json"
-  [[ -s "$SERVER_CONFIG" ]] && cp -a "$SERVER_CONFIG" "$target/server.json"
+  local target item
+  target="$(mktemp -d "${BACKUP_DIR}/$(date +%Y%m%d-%H%M%S).XXXXXX")" || return 1
+  chmod 0700 "$target" || { rm -rf -- "$target"; return 1; }
+  [[ -s "$STATE_FILE" ]] || { rm -rf -- "$target"; return 1; }
+  cp -a -- "$STATE_FILE" "$target/state.json" || { rm -rf -- "$target"; return 1; }
+  [[ ! -s "$SERVER_CONFIG" ]] || cp -a -- "$SERVER_CONFIG" "$target/server.json" || { rm -rf -- "$target"; return 1; }
+  [[ ! -f "$SERVICE_FILE" ]] || cp -a -- "$SERVICE_FILE" "$target/service.unit" || { rm -rf -- "$target"; return 1; }
+  for item in clients links qrcodes; do
+    case "$item" in
+      clients) [[ ! -d "$CLIENT_DIR" ]] || cp -a -- "$CLIENT_DIR" "$target/$item" || { rm -rf -- "$target"; return 1; } ;;
+      links) [[ ! -d "$LINK_DIR" ]] || cp -a -- "$LINK_DIR" "$target/$item" || { rm -rf -- "$target"; return 1; } ;;
+      qrcodes) [[ ! -d "$QR_DIR" ]] || cp -a -- "$QR_DIR" "$target/$item" || { rm -rf -- "$target"; return 1; } ;;
+    esac
+  done
   printf '%s\n' "$target"
 }
 
+restore_backup() {
+  local backup="$1" temp_root
+  [[ -s "$backup/state.json" ]] || return 1
+  atomic_install_file "$backup/state.json" "$STATE_FILE" 0600 || return 1
+  if [[ -s "$backup/server.json" ]]; then
+    atomic_install_file "$backup/server.json" "$SERVER_CONFIG" 0600 || return 1
+  else
+    rm -f -- "$SERVER_CONFIG" || return 1
+  fi
+  if [[ -s "$backup/service.unit" ]]; then
+    atomic_install_file "$backup/service.unit" "$SERVICE_FILE" 0644 || return 1
+  fi
+
+  temp_root="$(mktemp -d "${ROOT_DIR}/.restore.XXXXXX")" || return 1
+  install -d -m 0700 "$temp_root/clients" "$temp_root/links" "$temp_root/qrcodes" || { rm -rf -- "$temp_root"; return 1; }
+  [[ ! -d "$backup/clients" ]] || { rm -rf -- "$temp_root/clients"; cp -a -- "$backup/clients" "$temp_root/clients"; } || { rm -rf -- "$temp_root"; return 1; }
+  [[ ! -d "$backup/links" ]] || { rm -rf -- "$temp_root/links"; cp -a -- "$backup/links" "$temp_root/links"; } || { rm -rf -- "$temp_root"; return 1; }
+  [[ ! -d "$backup/qrcodes" ]] || { rm -rf -- "$temp_root/qrcodes"; cp -a -- "$backup/qrcodes" "$temp_root/qrcodes"; } || { rm -rf -- "$temp_root"; return 1; }
+  swap_generated_outputs "$temp_root" || { rm -rf -- "$temp_root"; return 1; }
+  rm -rf -- "$temp_root"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+prune_backups() {
+  local index
+  local -a backups=()
+  mapfile -t backups < <(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -nr | cut -d' ' -f2-)
+  for (( index = BACKUP_KEEP; index < ${#backups[@]}; index++ )); do
+    rm -rf -- "${backups[$index]}"
+  done
+}
+
 apply_candidate_state() {
-  local candidate="$1" candidate_config backup service_was_active=0
+  local candidate="$1" candidate_config backup
+  local service_was_active=0 service_was_enabled=0
   require_core || return 1
   state_valid "$candidate" || {
     error "候选状态格式不正确。"
@@ -969,57 +1291,64 @@ apply_candidate_state() {
   validate_state_certificates "$candidate" || return 1
   candidate_config="$(mktemp "${ROOT_DIR}/.server.XXXXXX.json")" || return 1
   render_server_config "$candidate" "$candidate_config" || {
-    rm -f "$candidate_config"
+    rm -f -- "$candidate_config"
     error "生成服务端候选配置失败。"
     return 1
   }
   if ! "$SINGBOX_BIN" check -c "$candidate_config"; then
-    rm -f "$candidate_config"
+    rm -f -- "$candidate_config"
     error "候选配置未通过 Sing-box 检查，不会替换现有配置。"
     return 1
   fi
-  backup="$(backup_current)" || { rm -f "$candidate_config"; return 1; }
-  generate_outputs "$candidate" || {
-    rm -f "$candidate_config"
+  backup="$(backup_current)" || { rm -f -- "$candidate_config"; return 1; }
+  if ! generate_outputs "$candidate"; then
+    rm -f -- "$candidate_config"
+    rm -rf -- "$backup"
     error "客户端配置生成失败，不会替换现有状态。"
     return 1
-  }
+  fi
   systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && service_was_active=1
-  install -m 0600 "$candidate" "$STATE_FILE"
-  install -m 0600 "$candidate_config" "$SERVER_CONFIG"
-  rm -f "$candidate_config"
+  systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null && service_was_enabled=1
+  if ! atomic_install_file "$candidate" "$STATE_FILE" 0600 ||
+     ! atomic_install_file "$candidate_config" "$SERVER_CONFIG" 0600; then
+    rm -f -- "$candidate_config"
+    restore_backup "$backup" || warn "自动恢复不完整，请检查备份：${backup}"
+    error "状态或服务端配置替换失败，已恢复。"
+    return 1
+  fi
+  rm -f -- "$candidate_config"
   if ! write_service_file; then
-    error "写入 systemd 服务失败，正在恢复上一个状态。"
-    [[ -s "$backup/state.json" ]] && install -m 0600 "$backup/state.json" "$STATE_FILE"
-    [[ -s "$backup/server.json" ]] && install -m 0600 "$backup/server.json" "$SERVER_CONFIG"
-    generate_outputs "$STATE_FILE" || true
+    restore_backup "$backup" || warn "自动恢复不完整，请检查备份：${backup}"
+    error "写入 systemd 服务失败，已恢复。"
     return 1
   fi
 
   if [[ "$(jq '.nodes|length' "$STATE_FILE")" -eq 0 ]]; then
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
     systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    prune_backups
     ok "状态已更新；当前没有节点，服务保持停止。"
     return 0
   fi
 
-  if systemctl enable --now "$SERVICE_NAME" && systemctl restart "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; then
-    if ! generate_outputs "$STATE_FILE"; then
-      warn "服务端已生效，但在线优选地址复测失败；保留启动前已校验的回退客户端配置。"
-    fi
+  if systemctl enable "$SERVICE_NAME" && systemctl restart "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; then
+    prune_backups
     ok "服务端配置已通过检查并生效。"
     return 0
   fi
 
   error "新配置启动失败，正在恢复上一个状态。"
-  [[ -s "$backup/state.json" ]] && install -m 0600 "$backup/state.json" "$STATE_FILE"
-  [[ -s "$backup/server.json" ]] && install -m 0600 "$backup/server.json" "$SERVER_CONFIG"
+  restore_backup "$backup" || warn "自动恢复不完整，请检查备份：${backup}"
   if (( service_was_active )); then
     systemctl restart "$SERVICE_NAME" || true
   else
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
   fi
-  generate_outputs "$STATE_FILE" || true
+  if (( service_was_enabled )); then
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  else
+    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  fi
   return 1
 }
 
@@ -1039,10 +1368,12 @@ ensure_server_address() {
     error "地址格式不正确。"
   done
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  jq --arg value "$input" '.server_address = $value' "$STATE_FILE" > "$candidate"
-  install -m 0600 "$candidate" "$STATE_FILE"
-  rm -f "$candidate"
-  ok "客户端连接地址已设为 ${input}。"
+  if ! jq --arg value "$input" '.server_address = $value' "$STATE_FILE" > "$candidate" ||
+     ! save_client_settings "$candidate" "客户端连接地址已设为 ${input}。"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  rm -f -- "$candidate"
 }
 
 port_in_state() {
@@ -1150,9 +1481,17 @@ choose_port() {
 }
 
 validate_certificate_bundle() {
-  local domain="$1" cert_file="$2" key_file="$3" leaf_file cert_hash key_hash end_date
+  local domain="$1" cert_file="$2" key_file="$3" leaf_file cert_hash key_hash end_date resolved
   [[ "$cert_file" == /* && -s "$cert_file" ]] || { error "完整证书链不存在或为空：${cert_file}"; return 1; }
   [[ "$key_file" == /* && -s "$key_file" ]] || { error "私钥不存在或为空：${key_file}"; return 1; }
+  for resolved in "$(readlink -f -- "$cert_file" 2>/dev/null)" "$(readlink -f -- "$key_file" 2>/dev/null)"; do
+    case "$resolved" in
+      /home/*|/root/*|/run/user/*)
+        error "systemd 安全策略无法读取 Home 目录中的证书，请将证书放到 /etc/acme/certs 或其他系统目录。"
+        return 1
+        ;;
+    esac
+  done
   if ! openssl x509 -in "$cert_file" -noout >/dev/null 2>&1; then
     error "无法解析证书文件：${cert_file}"
     return 1
@@ -1550,7 +1889,7 @@ edit_node() {
         apply_node_field_update "$id" '.server_name=$value' --arg value "$value"
       elif [[ "$type" == "vmess" ]]; then
         read -r -p "新的 WebSocket 路径（必须以 / 开头）：" value
-        [[ "$value" == /* && "$value" != *[[:space:]]* ]] || { error "WebSocket 路径格式不正确。"; return 1; }
+        validate_websocket_path "$value" || { error "WebSocket 路径只允许 URL 安全字符，并且必须以 / 开头。"; return 1; }
         apply_node_field_update "$id" '.path=$value' --arg value "$value"
       else
         error "该节点没有此选项。"
@@ -1603,14 +1942,14 @@ delete_node() {
   warn "将删除节点 ${id} 的服务端配置、桌面/软路由配置、链接和二维码。"
   (( argo_bound )) && warn "该节点绑定了 Argo，Argo 本地服务也会停止；不会删除 Cloudflare 远程 Tunnel。"
   confirm "确定删除？" || return 0
-  (( argo_bound )) && stop_argo_service
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
   jq --arg id "$id" '
     .nodes |= map(select(.id != $id)) |
     if .argo.node_id == $id then .argo = {enabled:false,mode:"",node_id:"",hostname:"",origin_port:0,provisioned:false,verified:false,tunnel_id:"",public_port:2096} else . end
   ' "$STATE_FILE" > "$candidate"
   if apply_candidate_state "$candidate"; then
-    rm -f "$candidate"
+    rm -f -- "$candidate"
+    (( argo_bound )) && stop_argo_service
     sync_firewall_if_managed
     ok "节点 ${id} 已删除。"
   else
@@ -1680,15 +2019,20 @@ install_cloudflared() {
     error "下载的 cloudflared 无法执行。"
     return 1
   fi
-  install -m 0755 "$temp_dir/$asset" "$CLOUDFLARED_BIN"
-  rm -rf "$temp_dir"
+  if ! atomic_install_file "$temp_dir/$asset" "$CLOUDFLARED_BIN" 0755; then
+    rm -rf -- "$temp_dir"
+    error "cloudflared 原子安装失败。"
+    return 1
+  fi
+  rm -rf -- "$temp_dir"
   ok "cloudflared 已安装。"
 }
 
 write_argo_service() {
-  local mode="$1" origin_port="$2"
+  local mode="$1" origin_port="$2" temporary
+  temporary="$(mktemp /tmp/mb-singbox-argo-service.XXXXXX)" || return 1
   if [[ "$mode" == "named" ]]; then
-    cat > "$ARGO_SERVICE_FILE" <<EOF
+    cat > "$temporary" <<EOF
 [Unit]
 Description=MB-Singbox Cloudflare Named Tunnel
 Wants=network-online.target ${SERVICE_NAME}
@@ -1713,7 +2057,7 @@ LockPersonality=true
 WantedBy=multi-user.target
 EOF
   else
-    cat > "$ARGO_SERVICE_FILE" <<EOF
+    cat > "$temporary" <<EOF
 [Unit]
 Description=MB-Singbox Cloudflare Quick Tunnel
 Wants=network-online.target ${SERVICE_NAME}
@@ -1738,7 +2082,11 @@ LockPersonality=true
 WantedBy=multi-user.target
 EOF
   fi
-  chmod 0644 "$ARGO_SERVICE_FILE"
+  if ! atomic_install_file "$temporary" "$ARGO_SERVICE_FILE" 0644; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  rm -f -- "$temporary"
   systemctl daemon-reload
 }
 
@@ -1773,12 +2121,15 @@ decode_tunnel_token() {
 CF_API_TOKEN=""
 cloudflare_api_request() {
   local method="$1" url="$2" data_file="$3" response_file="$4" curl_options rc
+  local -a retry_options=()
+  [[ "$CF_API_TOKEN" =~ ^[A-Za-z0-9_-]{20,256}$ ]] || return 1
+  [[ "$method" == "POST" ]] || retry_options=(--retry 2 --retry-delay 1)
   curl_options="$(printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$CF_API_TOKEN")"
   if [[ -n "$data_file" ]]; then
-    printf '%s' "$curl_options" | curl --config - --proto '=https' --tlsv1.2 --retry 2 --retry-delay 1 -sS \
+    printf '%s' "$curl_options" | curl --config - --proto '=https' --tlsv1.2 "${retry_options[@]}" -sS \
       -X "$method" --data-binary "@${data_file}" -o "$response_file" -w '%{http_code}' "$url" > "${response_file}.status"
   else
-    printf '%s' "$curl_options" | curl --config - --proto '=https' --tlsv1.2 --retry 2 --retry-delay 1 -sS \
+    printf '%s' "$curl_options" | curl --config - --proto '=https' --tlsv1.2 "${retry_options[@]}" -sS \
       -X "$method" -o "$response_file" -w '%{http_code}' "$url" > "${response_file}.status"
   fi
   rc="${PIPESTATUS[1]}"
@@ -1810,7 +2161,7 @@ provision_named_tunnel() {
   printf '  Zone    -> DNS -> Edit\n'
   read -r -s -p "Cloudflare API Token（仅本次使用，输入不可见）：" api_token
   printf '\n'
-  [[ -n "$api_token" ]] || { error "API Token 不能为空。"; return 1; }
+  [[ "$api_token" =~ ^[A-Za-z0-9_-]{20,256}$ ]] || { error "API Token 格式不正确。"; return 1; }
   read -r -p "DNS Zone ID：" zone_id
   [[ "$zone_id" =~ ^[0-9a-fA-F]{32}$ ]] || { error "Zone ID 应为 32 位十六进制字符串。"; return 1; }
   CF_API_TOKEN="$api_token"
@@ -1901,12 +2252,15 @@ verify_argo_endpoint() {
 set_argo_status() {
   local provisioned="$1" verified="$2" tunnel_id="${3:-}" candidate
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  jq --argjson provisioned "$provisioned" --argjson verified "$verified" --arg tunnel_id "$tunnel_id" '
+  if ! jq --argjson provisioned "$provisioned" --argjson verified "$verified" --arg tunnel_id "$tunnel_id" '
     .argo.provisioned=$provisioned | .argo.verified=$verified |
     if $tunnel_id != "" then .argo.tunnel_id=$tunnel_id else . end
-  ' "$STATE_FILE" > "$candidate"
-  install -m 0600 "$candidate" "$STATE_FILE"
-  rm -f "$candidate"
+  ' "$STATE_FILE" > "$candidate" || ! state_valid "$candidate" ||
+     ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  rm -f -- "$candidate"
 }
 
 verify_current_argo() {
@@ -1918,10 +2272,10 @@ verify_current_argo() {
   port="$(jq -r '.argo.public_port // 2096' "$STATE_FILE")"
   info "正在验证 wss://${hostname}:${port}${path}..."
   if verify_argo_endpoint "$hostname" "$path" "$port"; then
-    set_argo_status true true "$(jq -r '.argo.tunnel_id // ""' "$STATE_FILE")"
+    set_argo_status true true "$(jq -r '.argo.tunnel_id // ""' "$STATE_FILE")" || return 1
     ok "Argo 公网 WebSocket 已验证可用。"
   else
-    set_argo_status "$(jq -r '.argo.provisioned // false' "$STATE_FILE")" false "$(jq -r '.argo.tunnel_id // ""' "$STATE_FILE")"
+    set_argo_status "$(jq -r '.argo.provisioned // false' "$STATE_FILE")" false "$(jq -r '.argo.tunnel_id // ""' "$STATE_FILE")" || true
     return 1
   fi
 }
@@ -1966,29 +2320,38 @@ configure_argo() {
       validate_domain "$hostname" || { error "主机名格式不正确。"; return 1; }
       read -r -s -p "Cloudflare Tunnel Token（输入不可见）：" token
       printf '\n'
-      [[ -n "$token" ]] || { error "Token 不能为空。"; return 1; }
-      printf '%s' "$token" > "$ARGO_TOKEN_FILE"
-      chmod 0600 "$ARGO_TOKEN_FILE"
+      [[ "$token" =~ ^[A-Za-z0-9._=-]{40,4096}$ ]] || { error "Tunnel Token 格式不正确。"; return 1; }
+      printf '%s' "$token" > "$ARGO_TOKEN_FILE" || return 1
+      chmod 0600 "$ARGO_TOKEN_FILE" || { rm -f -- "$ARGO_TOKEN_FILE"; return 1; }
       ;;
     2) mode="quick"; hostname="" ;;
     *) error "无效选项。"; return 1 ;;
   esac
-  origin="$(random_local_port)" || { error "无法分配 Argo 本地端口。"; return 1; }
-  candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
+  origin="$(random_local_port)" || { rm -f -- "$ARGO_TOKEN_FILE"; error "无法分配 Argo 本地端口。"; return 1; }
+  candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || { rm -f -- "$ARGO_TOKEN_FILE"; return 1; }
   jq --arg mode "$mode" --arg id "$id" --arg hostname "$hostname" --argjson origin "$origin" '.argo={enabled:true,mode:$mode,node_id:$id,hostname:$hostname,origin_port:$origin,provisioned:false,verified:false,tunnel_id:"",public_port:2096}' "$STATE_FILE" > "$candidate"
   if ! apply_candidate_state "$candidate"; then
     rm -f "$candidate" "$ARGO_TOKEN_FILE"
     return 1
   fi
-  rm -f "$candidate"
-  write_argo_service "$mode" "$origin" || return 1
+  rm -f -- "$candidate"
+  if ! write_argo_service "$mode" "$origin"; then
+    rollback="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || { rm -f -- "$ARGO_TOKEN_FILE"; return 1; }
+    if jq '.argo={enabled:false,mode:"",node_id:"",hostname:"",origin_port:0,provisioned:false,verified:false,tunnel_id:"",public_port:2096}' "$STATE_FILE" > "$rollback"; then
+      apply_candidate_state "$rollback" || true
+    fi
+    rm -f -- "$rollback" "$ARGO_TOKEN_FILE"
+    error "Argo systemd 服务写入失败，已撤销本地配置。"
+    return 1
+  fi
   if ! systemctl enable --now "$ARGO_SERVICE_NAME" || ! systemctl is-active --quiet "$ARGO_SERVICE_NAME"; then
     error "Argo 服务启动失败，正在撤销本地 Argo 配置。"
     stop_argo_service
     rollback="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-    jq '.argo={enabled:false,mode:"",node_id:"",hostname:"",origin_port:0,provisioned:false,verified:false,tunnel_id:"",public_port:2096}' "$STATE_FILE" > "$rollback"
-    apply_candidate_state "$rollback" || true
-    rm -f "$rollback"
+    if jq '.argo={enabled:false,mode:"",node_id:"",hostname:"",origin_port:0,provisioned:false,verified:false,tunnel_id:"",public_port:2096}' "$STATE_FILE" > "$rollback"; then
+      apply_candidate_state "$rollback" || true
+    fi
+    rm -f -- "$rollback"
     return 1
   fi
   path="$(jq -r --arg id "$id" '.nodes[] | select(.id==$id) | .path' "$STATE_FILE")"
@@ -1999,8 +2362,11 @@ configure_argo() {
     }
     candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
     jq --arg hostname "$hostname" '.argo.hostname=$hostname | .argo.provisioned=true' "$STATE_FILE" > "$candidate"
-    install -m 0600 "$candidate" "$STATE_FILE"
-    rm -f "$candidate"
+    if ! save_client_settings "$candidate" "Quick Tunnel 域名已保存。"; then
+      rm -f -- "$candidate"
+      return 1
+    fi
+    rm -f -- "$candidate"
     provisioned=true
   else
     ARGO_TUNNEL_ID=""
@@ -2021,7 +2387,10 @@ configure_argo() {
       verified=true
     fi
   fi
-  set_argo_status "$provisioned" "$verified" "$tunnel_id"
+  set_argo_status "$provisioned" "$verified" "$tunnel_id" || {
+    warn "Argo 状态写入失败，请重新进入菜单检查。"
+    return 1
+  }
   generate_outputs "$STATE_FILE" || warn "Argo 状态已保存，但客户端配置生成失败。"
   if [[ "$verified" == "true" ]]; then
     ok "Argo 已自动配置并验证可用：${hostname}"
@@ -2036,10 +2405,11 @@ refresh_quick_argo() {
   hostname="$(wait_quick_hostname)" || { error "仍未从 cloudflared 日志取得随机域名。"; return 1; }
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
   jq --arg hostname "$hostname" '.argo.hostname=$hostname | .argo.provisioned=true | .argo.verified=false' "$STATE_FILE" > "$candidate"
-  install -m 0600 "$candidate" "$STATE_FILE"
-  rm -f "$candidate"
-  generate_outputs "$STATE_FILE"
-  info "Quick Tunnel 域名已更新：${hostname}"
+  if ! save_client_settings "$candidate" "Quick Tunnel 域名已更新：${hostname}"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  rm -f -- "$candidate"
   verify_current_argo
 }
 
@@ -2049,11 +2419,11 @@ disable_argo() {
   warn "将停止并删除 MB-Singbox 的本地 cloudflared 服务。"
   warn "Cloudflare 账户中的 Named Tunnel 不会被删除。"
   confirm "确定停用 Argo？" || return 0
-  stop_argo_service
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
   jq '.argo={enabled:false,mode:"",node_id:"",hostname:"",origin_port:0,provisioned:false,verified:false,tunnel_id:"",public_port:2096}' "$STATE_FILE" > "$candidate"
   if apply_candidate_state "$candidate"; then
-    rm -f "$candidate"
+    rm -f -- "$candidate"
+    stop_argo_service
     ok "Argo 已停用。"
   else
     rm -f "$candidate"
@@ -2090,30 +2460,81 @@ argo_menu() {
 }
 
 ufw_is_active() {
-  command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'
+  command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'
 }
 
 remove_managed_ufw_rules() {
   local numbers number
   command -v ufw >/dev/null 2>&1 || return 0
-  numbers="$(ufw status numbered 2>/dev/null | sed -n '/#[[:space:]]*MB-Singbox/s/^\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' | sort -rn)"
+  numbers="$(LC_ALL=C ufw status numbered 2>/dev/null | sed -n '/#[[:space:]]*MB-Singbox/s/^\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' | sort -rn)"
   while IFS= read -r number; do
-    [[ -n "$number" ]] && ufw --force delete "$number" >/dev/null
+    [[ -z "$number" ]] || ufw --force delete "$number" >/dev/null || return 1
   done <<<"$numbers"
 }
 
-sync_ufw_rules() {
+desired_ufw_rules() {
   local type port protocol
-  ufw_is_active || { error "UFW 尚未启用。"; return 1; }
-  remove_managed_ufw_rules
   while IFS=$'\t' read -r type port; do
     case "$type" in
       hysteria2|tuic) protocol=udp ;;
       *) protocol=tcp ;;
     esac
-    ufw allow "${port}/${protocol}" comment "MB-Singbox" >/dev/null || return 1
+    printf '%s\t%s\tMB-Singbox %s %s\n' "$protocol" "$port" "${protocol^^}" "$port"
   done < <(jq -r '.nodes[] | [.type, .port] | @tsv' "$STATE_FILE")
+}
+
+add_desired_ufw_rules() {
+  local protocol port comment
+  while IFS=$'\t' read -r protocol port comment; do
+    [[ -z "$protocol" ]] || ufw allow "${port}/${protocol}" comment "$comment" >/dev/null || return 1
+  done < <(desired_ufw_rules)
+}
+
+remove_obsolete_ufw_rules() {
+  local line number comment wanted desired numbers=""
+  local -a desired_comments=()
+  mapfile -t desired_comments < <(desired_ufw_rules | cut -f3-)
+  while IFS= read -r line; do
+    [[ "$line" == *"# MB-Singbox"* ]] || continue
+    number="$(sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' <<<"$line")"
+    comment="${line##*# }"
+    wanted=0
+    for desired in "${desired_comments[@]}"; do
+      [[ "$comment" == "$desired" ]] && { wanted=1; break; }
+    done
+    (( wanted )) || numbers+="${number}"$'\n'
+  done < <(LC_ALL=C ufw status numbered 2>/dev/null)
+  while IFS= read -r number; do
+    [[ -z "$number" ]] || ufw --force delete "$number" >/dev/null || return 1
+  done < <(printf '%s' "$numbers" | sort -rn)
+}
+
+sync_ufw_rules() {
+  ufw_is_active || { error "UFW 尚未启用。"; return 1; }
+  add_desired_ufw_rules || { error "新增 UFW 规则失败，原规则未删除。"; return 1; }
+  remove_obsolete_ufw_rules || return 1
   ok "UFW 已同步当前节点需要的 TCP/UDP 端口。"
+}
+
+detect_ssh_ports() {
+  local server_port candidate seen="," connection="${SSH_CONNECTION:-}"
+  local -a connection_parts=()
+  if [[ -n "$connection" ]]; then
+    read -r -a connection_parts <<< "$connection"
+    server_port="${connection_parts[3]:-}"
+    if validate_port "$server_port"; then
+      printf '%s\n' "$server_port"
+      seen+=",${server_port},"
+    fi
+  fi
+  if command -v sshd >/dev/null 2>&1; then
+    while IFS= read -r candidate; do
+      if validate_port "$candidate" && [[ "$seen" != *",${candidate},"* ]]; then
+        printf '%s\n' "$candidate"
+        seen+=",${candidate},"
+      fi
+    done < <(sshd -T 2>/dev/null | awk '$1=="port" {print $2}')
+  fi
 }
 
 sync_firewall_if_managed() {
@@ -2123,6 +2544,7 @@ sync_firewall_if_managed() {
 
 configure_ufw() {
   local ssh_port candidate
+  local -a ssh_ports=()
   if ! command -v ufw >/dev/null 2>&1; then
     confirm "系统没有 UFW，是否安装？" || return 0
     if command -v apt-get >/dev/null 2>&1; then
@@ -2133,30 +2555,44 @@ configure_ufw() {
     fi
   fi
   if ! ufw_is_active; then
-    ssh_port="$(sshd -T 2>/dev/null | awk '$1=="port" {print $2; exit}')"
-    ssh_port="${ssh_port:-22}"
-    warn "启用 UFW 会改变服务器入站防火墙。脚本会先放行 SSH TCP ${ssh_port} 和所有当前节点端口。"
-    confirm "确定启用 UFW？" || return 0
-    ufw allow "${ssh_port}/tcp" comment "SSH before MB-Singbox" >/dev/null || return 1
+    mapfile -t ssh_ports < <(detect_ssh_ports)
+    if (( ${#ssh_ports[@]} == 0 )); then
+      read -r -p "无法自动识别 SSH 端口，请输入当前 SSH 端口（输入 0 取消）：" ssh_port
+      [[ "$ssh_port" == "0" ]] && return 0
+      validate_port "$ssh_port" || { error "SSH 端口格式不正确，已取消启用 UFW。"; return 1; }
+      ssh_ports=("$ssh_port")
+    fi
+    warn "启用 UFW 会改变服务器入站防火墙。将先放行 SSH TCP：${ssh_ports[*]}，再放行全部节点端口。"
+    confirm "确认端口无误并启用 UFW？" || return 0
+    for ssh_port in "${ssh_ports[@]}"; do
+      ufw allow "${ssh_port}/tcp" comment "SSH before MB-Singbox" >/dev/null || return 1
+    done
+    add_desired_ufw_rules || { error "节点规则添加失败，不会启用 UFW。"; return 1; }
     ufw --force enable || return 1
   fi
   sync_ufw_rules || return 1
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  jq '.firewall_managed=true' "$STATE_FILE" > "$candidate"
-  install -m 0600 "$candidate" "$STATE_FILE"
-  rm -f "$candidate"
+  if ! jq '.firewall_managed=true' "$STATE_FILE" > "$candidate" || ! state_valid "$candidate" ||
+     ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  rm -f -- "$candidate"
   ok "MB-Singbox 将在节点增删后自动同步自己的 UFW 规则。"
 }
 
 disable_ufw_management() {
   local candidate
-  warn "只会删除注释为 MB-Singbox 的规则，不会停用 UFW，也不会删除其他规则。"
+  warn "只会删除 MB-Singbox 节点规则，不会停用 UFW，也不会删除 SSH 或其他规则。"
   confirm "确定停止管理并删除 MB-Singbox UFW 规则？" || return 0
-  remove_managed_ufw_rules
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  jq '.firewall_managed=false' "$STATE_FILE" > "$candidate"
-  install -m 0600 "$candidate" "$STATE_FILE"
-  rm -f "$candidate"
+  if ! jq '.firewall_managed=false' "$STATE_FILE" > "$candidate" || ! state_valid "$candidate" ||
+     ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  rm -f -- "$candidate"
+  remove_managed_ufw_rules || { warn "部分 UFW 规则删除失败，请手动检查。"; return 1; }
   ok "已停止管理 UFW。"
 }
 
@@ -2168,20 +2604,38 @@ show_bbr_status() {
 }
 
 enable_bbr() {
+  local candidate previous=""
   if ! modprobe tcp_bbr 2>/dev/null && ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
     error "当前内核不支持 BBR；脚本不会替换内核。"
     return 1
   fi
-  cat > "$BBR_FILE" <<'EOF'
+  candidate="$(mktemp /tmp/mb-singbox-bbr.XXXXXX)" || return 1
+  cat > "$candidate" <<'EOF'
 # Managed by MB-Singbox.
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
-  chmod 0644 "$BBR_FILE"
+  if [[ -f "$BBR_FILE" ]]; then
+    previous="$(mktemp /tmp/mb-singbox-bbr-previous.XXXXXX)" || { rm -f -- "$candidate"; return 1; }
+    cp -a -- "$BBR_FILE" "$previous" || { rm -f -- "$candidate" "$previous"; return 1; }
+  fi
+  if ! atomic_install_file "$candidate" "$BBR_FILE" 0644; then
+    rm -f -- "$candidate" "$previous"
+    return 1
+  fi
+  rm -f -- "$candidate"
   if sysctl --system >/dev/null && [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
+    rm -f -- "$previous"
     ok "BBR + fq 已启用。它只直接作用于 TCP，不加速 Hysteria2/TUIC 的 QUIC 拥塞控制。"
   else
-    error "BBR 应用失败。"
+    if [[ -s "$previous" ]]; then
+      atomic_install_file "$previous" "$BBR_FILE" 0644 || true
+    else
+      rm -f -- "$BBR_FILE"
+    fi
+    rm -f -- "$previous"
+    sysctl --system >/dev/null 2>&1 || true
+    error "BBR 应用失败，已恢复原配置。"
     return 1
   fi
 }
@@ -2195,7 +2649,9 @@ disable_bbr() {
 
 http_probe() {
   local name="$1" url="$2" code
-  code="$(curl --proto '=https' --tlsv1.2 -L -o /dev/null -sS --connect-timeout 8 --max-time 15 -w '%{http_code}' "$url" 2>/dev/null || printf '000')"
+  if ! code="$(curl --proto '=https' --tlsv1.2 -L -o /dev/null -sS --connect-timeout 8 --max-time 15 -w '%{http_code}' "$url" 2>/dev/null)"; then
+    code="000"
+  fi
   if [[ "$code" =~ ^(200|204|301|302|307|308|401)$ ]]; then
     printf '%-12s 可访问（HTTP %s）\n' "$name" "$code"
   elif [[ "$code" == "403" || "$code" == "451" ]]; then
@@ -2215,21 +2671,20 @@ check_ai_access() {
 }
 
 save_client_settings() {
-  local candidate="$1" previous
-  previous="$(mktemp "${ROOT_DIR}/.state-previous.XXXXXX.json")" || return 1
-  cp -a "$STATE_FILE" "$previous"
-  install -m 0600 "$candidate" "$STATE_FILE"
-  if [[ "$(jq '.nodes|length' "$STATE_FILE")" -gt 0 ]] && [[ -x "$SINGBOX_BIN" ]]; then
-    if ! generate_outputs "$STATE_FILE"; then
-      install -m 0600 "$previous" "$STATE_FILE"
-      generate_outputs "$STATE_FILE" || true
-      rm -f "$previous"
-      error "客户端设置未能生成有效配置，已恢复。"
+  local candidate="$1" success_message="${2:-客户端设置已保存。}"
+  state_valid "$candidate" || { error "客户端候选状态无效。"; return 1; }
+  if [[ "$(jq '.nodes|length' "$candidate")" -gt 0 ]] && [[ -x "$SINGBOX_BIN" ]]; then
+    if ! generate_outputs "$candidate"; then
+      error "客户端设置未能生成有效配置，原状态保持不变。"
       return 1
     fi
   fi
-  rm -f "$previous"
-  ok "客户端设置已保存。"
+  if ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
+    generate_outputs "$STATE_FILE" >/dev/null 2>&1 || true
+    error "客户端状态保存失败，原状态保持不变。"
+    return 1
+  fi
+  ok "$success_message"
 }
 
 client_settings_menu() {
@@ -2240,7 +2695,7 @@ client_settings_menu() {
   acquire_lock || return 1
   while true; do
     printf '\n客户端与 VMess/Argo 优选地址：\n'
-    printf '状态：%s\n' "$(jq -r 'if (.client.preferred_enabled // true) then "已启用" else "已关闭" end' "$STATE_FILE")"
+    printf '状态：%s\n' "$(jq -r 'if (.client.preferred_enabled != false) then "已启用" else "已关闭" end' "$STATE_FILE")"
     printf '候选池（仅在手动实测时随机检查最多 3 个）：\n'
     jq -r '.client.preferred_addresses[]? | "  - " + .' "$STATE_FILE"
     if [[ "$(jq -r '.client.preferred_last_probe_at // ""' "$STATE_FILE")" != "" ]]; then
@@ -2258,7 +2713,7 @@ client_settings_menu() {
     case "$choice" in
       1)
         candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-        jq '.client.preferred_enabled = ((.client.preferred_enabled // true) | not)' "$STATE_FILE" > "$candidate"
+        jq '.client.preferred_enabled = ((.client.preferred_enabled != false) | not)' "$STATE_FILE" > "$candidate"
         save_client_settings "$candidate"
         rm -f "$candidate"
         pause
@@ -2270,7 +2725,7 @@ client_settings_menu() {
         valid_addresses=()
         for address in "${raw_addresses[@]}"; do
           address="$(trim "${address,,}")"
-          if validate_domain "$address" || [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+          if validate_domain "$address" || validate_ipv4 "$address"; then
             valid_addresses+=("$address")
           elif [[ -n "$address" ]]; then
             error "候选地址格式不正确：${address}"
@@ -2427,11 +2882,11 @@ install_quick_command() {
 }
 
 install_manager_binary() {
-  install -d -m 0755 "$(dirname "$INSTALL_PATH")"
+  install -d -m 0755 "$(dirname "$INSTALL_PATH")" || return 1
   if [[ "$SELF_PATH" == "$INSTALL_PATH" ]]; then
-    chmod 0755 "$INSTALL_PATH"
+    chmod 0755 "$INSTALL_PATH" || return 1
   elif [[ -n "$SELF_PATH" && -f "$SELF_PATH" ]]; then
-    install -m 0755 "$SELF_PATH" "$INSTALL_PATH"
+    atomic_install_file "$SELF_PATH" "$INSTALL_PATH" 0755 || return 1
   else
     error "当前脚本来自临时数据流，无法安装固定副本。请使用 install.sh。"
     return 1
@@ -2471,16 +2926,23 @@ update_manager() {
     return 1
   fi
 
-  [[ -f "$INSTALL_PATH" ]] && cp -a "$INSTALL_PATH" "$backup"
-  install -m 0755 "$candidate" "$INSTALL_PATH"
-  rm -f "$candidate"
+  if [[ -f "$INSTALL_PATH" ]] && ! cp -a -- "$INSTALL_PATH" "$backup"; then
+    rm -f -- "$candidate" "$backup"
+    return 1
+  fi
+  if ! atomic_install_file "$candidate" "$INSTALL_PATH" 0755; then
+    rm -f -- "$candidate" "$backup"
+    error "管理器原子替换失败，原版本保持不变。"
+    return 1
+  fi
+  rm -f -- "$candidate"
   if [[ "$("$INSTALL_PATH" version 2>/dev/null)" != "mb-singbox ${new_version}" ]]; then
-    [[ -s "$backup" ]] && install -m 0755 "$backup" "$INSTALL_PATH"
-    rm -f "$backup"
+    [[ ! -s "$backup" ]] || atomic_install_file "$backup" "$INSTALL_PATH" 0755 || true
+    rm -f -- "$backup"
     error "更新后的管理器自检失败，已恢复旧版本。"
     return 1
   fi
-  rm -f "$backup"
+  rm -f -- "$backup"
   ok "MB-Singbox 管理器已更新：${VERSION} -> ${new_version}"
 }
 
@@ -2490,7 +2952,7 @@ maintenance_menu() {
     printf '\n安装/更新：\n'
     printf '当前管理器：%s\n' "$VERSION"
     printf '当前内核：%s\n' "$(current_core_version 2>/dev/null || printf '未安装')"
-    printf '  1. 安装/更新 Sing-box 最新稳定版\n  2. 安装指定 Sing-box 稳定版本\n  3. 更新 MB-Singbox 管理器\n  4. 重新生成并应用全部配置\n  0. 返回\n'
+    printf '  1. 安装/更新 Sing-box 最新稳定版\n  2. 安装指定 Sing-box 稳定版本\n  3. 更新 MB-Singbox 管理器\n  4. 重新生成并应用全部配置\n  5. 运行安装诊断\n  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
       1) install_or_update_core; pause ;;
@@ -2511,6 +2973,7 @@ maintenance_menu() {
         regenerate_all_configs
         pause
         ;;
+      5) doctor; pause ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac
@@ -2520,6 +2983,7 @@ maintenance_menu() {
 uninstall_all() {
   require_root
   init_state || return 1
+  validate_managed_layout || return 1
   printf '\n%s彻底卸载范围%s\n' "$C_BOLD" "$C_RESET"
   printf '将删除：MB-Singbox 服务、内核、状态、服务端/客户端配置、链接、二维码、备份、日志、cloudflared 本地服务、UFW 自建规则和 BBR sysctl 文件。\n'
   printf '不会删除：MB-ACME、/etc/acme/certs、Cloudflare 远程 Named Tunnel、系统其他 UFW/sysctl 配置。\n'
@@ -2528,14 +2992,19 @@ uninstall_all() {
   read -r -p "请输入 DELETE 确认：" _confirm_word
   [[ "$_confirm_word" == "DELETE" ]] || { info "已取消。"; return 0; }
 
+  safe_to_remove_managed_root "$ROOT_DIR" && safe_to_remove_managed_root "$LOG_DIR" && safe_to_remove_managed_root "$SINGBOX_HOME" &&
+    managed_marker_valid "$ROOT_DIR" && managed_marker_valid "$LOG_DIR" && managed_marker_valid "$SINGBOX_HOME" || {
+    error "受管目录路径或标记不安全，拒绝递归删除。请手动检查安装目录。"
+    return 1
+  }
   stop_argo_service
   systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-  rm -f "$SERVICE_FILE"
+  rm -f -- "$SERVICE_FILE"
   systemctl daemon-reload >/dev/null 2>&1 || true
-  remove_managed_ufw_rules
-  rm -f "$BBR_FILE"
+  remove_managed_ufw_rules || warn "部分 UFW 规则未能自动删除。"
+  rm -f -- "$BBR_FILE"
   sysctl --system >/dev/null 2>&1 || true
-  rm -rf "$ROOT_DIR" "$LOG_DIR" "$SINGBOX_HOME"
+  rm -rf -- "$ROOT_DIR" "$LOG_DIR" "$SINGBOX_HOME"
   if [[ -L "$QUICK_PATH" && "$(readlink -f "$QUICK_PATH" 2>/dev/null || true)" == "$INSTALL_PATH" ]]; then
     rm -f "$QUICK_PATH"
   fi
@@ -2551,6 +3020,34 @@ show_status_line() {
   nodes="$(jq '.nodes|length' "$STATE_FILE" 2>/dev/null || printf '0')"
   if jq -e '.argo.enabled' "$STATE_FILE" >/dev/null 2>&1; then argo="已启用"; else argo="未启用"; fi
   printf 'Sing-box：%s  服务：%s  节点：%s  Argo：%s\n' "$core" "$service" "$nodes" "$argo"
+}
+
+doctor() {
+  local installed_version="未安装" installed_hash="未知" remote_version="无法获取" quick_target="不存在" service_state="未知"
+  [[ ! -x "$INSTALL_PATH" ]] || installed_version="$("$INSTALL_PATH" version 2>/dev/null || printf '无法执行')"
+  [[ ! -f "$INSTALL_PATH" ]] || installed_hash="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || printf '未知')"
+  [[ ! -e "$QUICK_PATH" && ! -L "$QUICK_PATH" ]] || quick_target="$(readlink -f "$QUICK_PATH" 2>/dev/null || printf '无法解析')"
+  if command -v curl >/dev/null 2>&1; then
+    remote_version="$(curl --proto '=https' --tlsv1.2 -fsSL "${MANAGER_RAW_BASE}/mb-singbox.sh?ts=$(date +%s)" 2>/dev/null | awk -F '"' '/^VERSION="[0-9]/{print $2; exit}')"
+    remote_version="${remote_version:-无法获取}"
+  fi
+
+  printf '管理器当前进程：mb-singbox %s\n' "$VERSION"
+  printf '固定安装文件：%s（%s）\n' "$INSTALL_PATH" "$installed_version"
+  printf '快捷命令目标：%s -> %s\n' "$QUICK_PATH" "$quick_target"
+  printf '安装文件 SHA-256：%s\n' "$installed_hash"
+  printf '远端 %s@%s：%s\n' "$MANAGER_REPO" "$MANAGER_REF" "$remote_version"
+  printf 'Sing-box 内核：%s\n' "$(current_core_version 2>/dev/null || printf '未安装')"
+  if [[ -s "$STATE_FILE" ]] && state_valid "$STATE_FILE"; then
+    printf '状态文件：有效（%s）\n' "$STATE_FILE"
+  else
+    printf '状态文件：缺失或无效（%s）\n' "$STATE_FILE"
+  fi
+  service_state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
+  printf '服务：%s\n' "${service_state:-未知}"
+  printf '命令解析：\n'
+  type -a singbox 2>/dev/null || true
+  type -a mb-singbox 2>/dev/null || true
 }
 
 banner() {
@@ -2623,6 +3120,7 @@ ${PROGRAM} ${VERSION}
   singbox check              检查当前服务端配置
   singbox render             重新生成、校验并应用全部配置
   singbox status             查看状态
+  singbox doctor             检查版本、路径和安装状态
   singbox version
 
 兼容命令：${PROGRAM}
@@ -2642,6 +3140,7 @@ main() {
     check) require_root; check_configuration ;;
     render) require_root; regenerate_all_configs ;;
     status) require_root; init_state; show_status_line; list_nodes ;;
+    doctor) require_root; doctor ;;
     version|--version|-v) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     help|--help|-h) show_help ;;
     *) error "未知命令：${command}"; show_help; return 2 ;;
