@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.3.1"
+VERSION="0.3.2"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/singbox}"
@@ -25,6 +25,7 @@ SINGBOX_HOME="${MB_SINGBOX_CORE_DIR:-/usr/local/lib/mb-singbox}"
 SINGBOX_BIN="${MB_SINGBOX_BIN:-${SINGBOX_HOME}/sing-box}"
 SERVICE_FILE="${MB_SINGBOX_SERVICE_FILE:-/etc/systemd/system/mb-singbox.service}"
 SERVICE_NAME="mb-singbox.service"
+DEFAULT_REALITY_TARGET="www.cloudflare.com"
 CLOUDFLARED_BIN="${MB_SINGBOX_CLOUDFLARED_BIN:-${SINGBOX_HOME}/cloudflared}"
 ARGO_SERVICE_FILE="${MB_SINGBOX_ARGO_SERVICE_FILE:-/etc/systemd/system/mb-singbox-argo.service}"
 ARGO_SERVICE_NAME="mb-singbox-argo.service"
@@ -407,7 +408,7 @@ install_or_update_core() {
   }
   if [[ "$(printf '%s\n' "1.13.0" "$version" | sort -V | head -n 1)" != "1.13.0" ]]; then
     rm -rf "$(dirname "$(dirname "$extracted")")"
-    error "MB-Singbox 0.3.1 最低支持 Sing-box 1.13.0，拒绝安装 ${version}。"
+    error "MB-Singbox ${VERSION} 最低支持 Sing-box 1.13.0，拒绝安装 ${version}。"
     return 1
   fi
 
@@ -675,7 +676,8 @@ render_client_config() {
 }
 
 node_share_link() {
-  local node_json="$1" server="$2" argo_hostname="${3:-}" connect_address="${4:-$argo_hostname}" argo_port="${5:-2096}"
+  local node_json="$1" server="$2" argo_hostname="${3:-}"
+  local connect_address="${4:-$argo_hostname}" argo_port="${5:-2096}"
   local type name port uri_host uuid password tls_domain path short_id public_key obfs vmess_json
   type="$(jq -r '.type' <<<"$node_json")"
   name="$(jq -r '.name' <<<"$node_json")"
@@ -968,6 +970,73 @@ port_listening() {
   fi
 }
 
+pick_unused_tcp_port() {
+  local excluded="${1:-0}" candidate attempt
+  for (( attempt = 0; attempt < 50; attempt++ )); do
+    candidate=$((30000 + RANDOM % 30000))
+    if (( candidate != excluded )) && ! port_listening "$candidate" tcp; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+reality_target_compatible() (
+  local node_json="$1" target server_port socks_port temp_dir test_node outbound
+  local server_pid="" client_pid="" rc=1
+  target="$(jq -r '.server_name' <<<"$node_json")"
+  server_port="$(pick_unused_tcp_port)" || return 1
+  socks_port="$(pick_unused_tcp_port "$server_port")" || return 1
+  temp_dir="$(mktemp -d /tmp/mb-reality-check.XXXXXX)" || return 1
+  cleanup_reality_probe() {
+    [[ -n "$client_pid" ]] && kill "$client_pid" 2>/dev/null || true
+    [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null || true
+    [[ -n "$client_pid" ]] && wait "$client_pid" 2>/dev/null || true
+    [[ -n "$server_pid" ]] && wait "$server_pid" 2>/dev/null || true
+    rm -rf "$temp_dir"
+  }
+  trap cleanup_reality_probe EXIT
+  trap 'exit 130' HUP INT TERM
+
+  test_node="$(jq --argjson port "$server_port" '.port=$port' <<<"$node_json")"
+  jq -n --argjson node "$test_node" '{nodes:[$node],argo:{enabled:false}}' > "$temp_dir/state.json"
+  render_server_config "$temp_dir/state.json" "$temp_dir/server.json" || return 1
+  jq '(.inbounds[] | select(.type == "vless")).listen = "127.0.0.1" | .log.level = "error"' \
+    "$temp_dir/server.json" > "$temp_dir/server.next" || return 1
+  mv "$temp_dir/server.next" "$temp_dir/server.json"
+
+  outbound="$(make_outbound_json "$test_node" "127.0.0.1")" || return 1
+  jq -n --argjson outbound "$outbound" --argjson port "$socks_port" '{
+    log: {level:"error",timestamp:true},
+    inbounds: [{type:"mixed",tag:"check-in",listen:"127.0.0.1",listen_port:$port}],
+    outbounds: [$outbound],
+    route: {final:$outbound.tag}
+  }' > "$temp_dir/client.json"
+
+  "$SINGBOX_BIN" check -c "$temp_dir/server.json" >/dev/null || return 1
+  "$SINGBOX_BIN" check -c "$temp_dir/client.json" >/dev/null || return 1
+  "$SINGBOX_BIN" run -c "$temp_dir/server.json" > "$temp_dir/server.log" 2>&1 &
+  server_pid=$!
+  sleep 0.5
+  kill -0 "$server_pid" 2>/dev/null || return 1
+  "$SINGBOX_BIN" run -c "$temp_dir/client.json" > "$temp_dir/client.log" 2>&1 &
+  client_pid=$!
+  sleep 0.5
+  kill -0 "$client_pid" 2>/dev/null || return 1
+
+  if curl --socks5-hostname "127.0.0.1:${socks_port}" --connect-timeout 5 --max-time 10 \
+    -sSI "https://${target}/" >/dev/null 2> "$temp_dir/curl.log"; then
+    rc=0
+  elif grep -Eq 'processed invalid connection|reality verification failed' \
+    "$temp_dir/server.log" "$temp_dir/client.log" 2>/dev/null; then
+    warn "Reality 握手目标 ${target} 未通过真实协议校验。"
+  else
+    warn "无法通过临时 Reality 隧道访问 ${target}:443。"
+  fi
+  return "$rc"
+)
+
 choose_port() {
   local network="$1" default="$2" input
   while true; do
@@ -1064,8 +1133,8 @@ add_reality_node() {
   name="$(read_node_name "Reality")" || return 1
   id="$(safe_id "$name")"
   port="$(choose_port tcp 443)" || return 1
-  read -r -p "Reality 握手域名 [www.microsoft.com]：" target
-  target="${target:-www.microsoft.com}"
+  read -r -p "Reality 握手域名 [${DEFAULT_REALITY_TARGET}]：" target
+  target="${target:-$DEFAULT_REALITY_TARGET}"
   target="${target,,}"
   validate_domain "$target" || { error "握手域名格式不正确。"; return 1; }
   uuid="$(new_uuid)"
@@ -1075,6 +1144,12 @@ add_reality_node() {
   [[ -n "$private_key" && -n "$public_key" ]] || { error "Reality 密钥生成失败。"; return 1; }
   short_id="$(openssl rand -hex 8)"
   node="$(jq -n --arg id "$id" --arg name "$name" --argjson port "$port" --arg uuid "$uuid" --arg server_name "$target" --arg private_key "$private_key" --arg public_key "$public_key" --arg short_id "$short_id" '{id:$id,name:$name,type:"reality",port:$port,uuid:$uuid,server_name:$server_name,private_key:$private_key,public_key:$public_key,short_id:$short_id}')"
+  info "正在对 ${target}:443 执行临时 Reality 端到端校验..."
+  reality_target_compatible "$node" || {
+    error "该握手目标与当前网络或 Sing-box 内核不兼容，节点未创建。"
+    return 1
+  }
+  ok "Reality 握手目标已通过端到端校验。"
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
   jq --argjson node "$node" '.nodes += [$node]' "$STATE_FILE" > "$candidate"
   if apply_candidate_state "$candidate"; then
@@ -1320,6 +1395,14 @@ edit_node() {
         read -r -p "新的 Reality 握手域名：" value
         value="${value,,}"
         validate_domain "$value" || { error "域名格式不正确。"; return 1; }
+        local test_node
+        test_node="$(jq --arg value "$value" '.server_name=$value' <<<"$node")"
+        info "正在对 ${value}:443 执行临时 Reality 端到端校验..."
+        reality_target_compatible "$test_node" || {
+          error "该握手目标与当前网络或 Sing-box 内核不兼容，配置未修改。"
+          return 1
+        }
+        ok "Reality 握手目标已通过端到端校验。"
         apply_node_field_update "$id" '.server_name=$value' --arg value "$value"
       elif [[ "$type" == "vmess" ]]; then
         read -r -p "新的 WebSocket 路径（必须以 / 开头）：" value

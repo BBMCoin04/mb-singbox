@@ -1,6 +1,6 @@
 # MB-Singbox
 
-面向 systemd Linux VPS 的 Sing-box 节点管理器。当前版本 `0.3.1` 生成可由真实 Sing-box 内核校验的服务端配置、Windows 客户端配置、Linux/OpenWrt 软路由配置、分享链接和二维码。
+面向 systemd Linux VPS 的 Sing-box 节点管理器。当前版本 `0.3.2` 生成可由真实 Sing-box 内核校验的服务端配置、Windows 客户端配置、Linux/OpenWrt 软路由配置、分享链接和二维码。
 
 脚本不捆绑订阅服务器、WARP 或流媒体解锁。状态、服务端配置和客户端配置都保存在 root 专用目录；Reality 私钥不会写入客户端文件、分享链接或二维码。
 
@@ -34,6 +34,8 @@ TCP 和 UDP 是不同的传输空间，因此同一数字的 TCP/UDP 端口可�
 
 所有默认端口都可以在创建节点时手动修改。脚本分别检查 TCP 和 UDP 占用。
 
+Reality 默认握手目标是 `www.cloudflare.com:443`。创建节点或修改握手域名时，脚本会在随机回环端口临时启动服务端和客户端，执行一次真实 Reality 端到端校验；目标不兼容、无法从 VPS 访问或 Reality 校验失败时，不会写入配置。仅通过普通 `curl` 或 TLS 探测不能证明目标与 Reality 兼容。
+
 ## 安装与启动
 
 推荐先下载再执行：
@@ -60,6 +62,15 @@ sudo singbox
 ```
 
 `mb-singbox` 仍作为兼容命令保留。安装器不会覆盖已有的 `/usr/local/bin/singbox`；若该路径被其他程序占用，会明确报错。
+
+systemd 单元名称是 `mb-singbox.service`，不是 `sing-box.service`：
+
+```bash
+systemctl status mb-singbox --no-pager -l
+journalctl -u mb-singbox -n 100 --no-pager
+```
+
+因此，`systemctl status sing-box` 返回 `Unit sing-box.service could not be found` 不代表 MB-Singbox 内核没有运行。
 
 ## 推荐部署顺序
 
@@ -227,6 +238,18 @@ BBR 只在当前内核已经支持时启用，并写入：
 ```
 
 BBR 主要作用于 TCP，不直接加速 Hysteria 2/TUIC 的 QUIC 拥塞控制。
+
+## Reality 故障定位
+
+服务端日志出现 `REALITY: processed invalid connection` 表示 TCP 已到达监听端口，但本次 TLS 连接没有被识别为有效 Reality 会话。按以下顺序检查：
+
+1. 使用正确的服务名确认进程和监听：`systemctl status mb-singbox`、`ss -ltnp`。
+2. 运行 `singbox check`，确认当前 `/etc/mb-singbox/server.json` 可由已安装内核加载。
+3. 确认 VPS 和客户端时间同步；服务端默认允许最大一分钟时间差。
+4. 在菜单 `4 -> Reality 节点 -> 4` 中更换握手域名。`www.microsoft.com` 等普通 TLS 可达站点不一定适合作为 Reality 握手目标。
+5. 从菜单 `3` 重新取得分享链接并在 v2rayN 中删除旧节点后重新导入，避免保留旧的 UUID、公钥或 short ID。
+
+分享链接中的 `pbk` 来自服务端私钥对应的公钥，`sid` 与服务端 `short_id` 相同，`sni` 与握手域名相同；脚本不会把 Reality 私钥写进客户端文件。
 
 ## 更新、校验与回滚
 
