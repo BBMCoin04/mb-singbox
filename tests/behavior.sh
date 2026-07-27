@@ -19,10 +19,14 @@ export MB_SINGBOX_CORE_DIR="$TEST_ROOT/core"
 export MB_SINGBOX_BIN="$TEST_ROOT/core/sing-box"
 export MB_SINGBOX_LOCK_FILE="$TEST_ROOT/lock"
 export MB_SINGBOX_INSTALL_PATH="$TEST_ROOT/bin/mb-singbox"
+export MB_SINGBOX_QUICK_PATH="$TEST_ROOT/bin/singbox"
 
 # shellcheck disable=SC1091
 source "$PROJECT_DIR/mb-singbox.sh"
 ensure_directories
+install_manager_binary
+[[ "$(readlink -f "$MB_SINGBOX_QUICK_PATH")" == "$MB_SINGBOX_INSTALL_PATH" ]]
+[[ "$(MB_SINGBOX_NO_MAIN=0 "$MB_SINGBOX_QUICK_PATH" version)" == "mb-singbox 0.3.0" ]]
 
 # Nested version input must accept 0 and return to the parent menu.
 printf '2\n0\n0\n' | maintenance_menu >/dev/null
@@ -31,7 +35,8 @@ printf '2\n0\n0\n' | maintenance_menu >/dev/null
 jq -n '{schema:1,server_address:"203.0.113.10",created_at:"2026-07-27T00:00:00Z",firewall_managed:false,nodes:[{id:"node-1",name:"Node One",type:"vmess",port:443}],argo:{enabled:true,mode:"named",node_id:"node-1",hostname:"argo.example.com",origin_port:23456}}' > "$STATE_FILE"
 init_state
 jq -e '.nodes|length==1' "$STATE_FILE" >/dev/null
-jq -e '.argo.mode=="named" and .argo.provisioned==false and .argo.verified==false and .argo.tunnel_id==""' "$STATE_FILE" >/dev/null
+jq -e '.argo.mode=="named" and .argo.provisioned==false and .argo.verified==false and .argo.tunnel_id=="" and .argo.public_port==2096' "$STATE_FILE" >/dev/null
+jq -e '.client.preferred_enabled==true and (.client.preferred_addresses|length)==5' "$STATE_FILE" >/dev/null
 [[ "$(printf '1\n' | select_node_id 'Select')" == "node-1" ]]
 
 # Tunnel tokens are decoded without writing the secret into state.
@@ -84,7 +89,13 @@ curl() {
   done
   printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n' > "$headers"
 }
-verify_argo_endpoint "argo.example.com" "/vmess" >/dev/null
+verify_argo_endpoint "argo.example.com" "/vmess" 2096 >/dev/null
+
+# Preferred address selection only accepts candidates that pass the strict probe.
+probe_preferred_address() { [[ "$1" == "www.cloudflare.com" ]]; }
+jq '.client.preferred_addresses=["bad.example.com","www.cloudflare.com"]' "$STATE_FILE" > "$TEST_ROOT/preferred-state.json"
+RANDOM=1
+[[ "$(select_preferred_address "$TEST_ROOT/preferred-state.json" "argo.example.com" 2096 "/vmess")" == "www.cloudflare.com" ]]
 
 # Manager update directly validates and atomically installs the downloaded main script.
 require_root() { :; }
@@ -98,9 +109,8 @@ curl() {
   [[ -n "$output" ]] || return 1
   cp "$PROJECT_DIR/mb-singbox.sh" "$output"
 }
-mkdir -p "$(dirname "$INSTALL_PATH")"
 unset MB_SINGBOX_NO_MAIN
 update_manager >/dev/null
-[[ "$($INSTALL_PATH version)" == "mb-singbox 0.2.0" ]]
+[[ "$($INSTALL_PATH version)" == "mb-singbox 0.3.0" ]]
 
-printf 'Behavior passed: menu return, state migration, node selection, Cloudflare provisioning, manager update.\n'
+printf 'Behavior passed: menu return, state migration, preferred address, Cloudflare provisioning, manager update.\n'

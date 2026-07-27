@@ -1,284 +1,262 @@
 # MB-Singbox
 
-面向 Linux VPS 的轻量 Sing-box 管理器。当前版本 `0.2.0` 重点解决三件事：生成可被真实 Sing-box 内核接受的服务端配置、生成完整且防 DNS 泄漏的 Windows 桌面端配置、稳定输出分享链接和二维码。
+面向 systemd Linux VPS 的 Sing-box 节点管理器。当前版本 `0.3.0` 生成可由真实 Sing-box 内核校验的服务端配置、Windows 客户端配置、Linux/OpenWrt 软路由配置、分享链接和二维码。
 
-项目不捆绑订阅服务器、WARP、流媒体解锁或其他与节点管理无关的功能。所有配置变化都先生成候选文件，逐份执行 `sing-box check`；服务端和任意桌面配置有一份失败，就不会替换现有产物。服务启动失败会恢复上一份状态和配置。
+脚本不捆绑订阅服务器、WARP 或流媒体解锁。状态、服务端配置和客户端配置都保存在 root 专用目录；Reality 私钥不会写入客户端文件、分享链接或二维码。
 
-## 第一版范围
+## 支持范围
 
-支持以下服务端节点，可同时运行多个：
+服务端可以同时运行：
 
-- VLESS-Reality-Vision，TCP，无需证书。
-- Hysteria2 + Salamander，UDP，需要 TLS 证书。
-- TUIC v5，UDP，需要 TLS 证书。
-- AnyTLS，TCP，需要 TLS 证书。
-- VMess-WebSocket-TLS，TCP，需要 TLS 证书。
+- VLESS + REALITY + Vision
+- Hysteria 2 + Salamander
+- AnyTLS
+- TUIC v5
+- VMess + WebSocket + TLS
+- VMess + WebSocket + Cloudflare Tunnel 应急入口
 
-每个节点会生成：
+最低支持 Sing-box `1.13.0`。默认只安装 GitHub 正式 Release，不安装 alpha、beta 或其他预发布版本。内核压缩包会按 Release 元数据执行 SHA-256 校验。
 
-- Windows 官方 Sing-box 完整 TUN 配置。
-- Windows 官方 Sing-box 完整系统代理配置。
-- 标准或主流兼容分享链接。
-- 终端二维码和 PNG 二维码。
+## 默认端口
 
-还会生成包含全部直连节点及可用 Argo 节点的 Windows 汇总配置。
+TCP 和 UDP 是不同的传输空间，因此同一数字的 TCP/UDP 端口可以共存：
 
-第一版客户端以 Windows 桌面端为主。HomeProxy、Nikki 和 Momo 的专用导出不在本版范围内；其中 HomeProxy 使用 Sing-box 配置模型，而 Nikki/Momo 使用 Mihomo 配置模型，不能用同一份 JSON 假装兼容。
+```text
+443/TCP   VLESS + REALITY
+443/UDP   Hysteria 2
+8443/TCP  AnyTLS
+8443/UDP  TUIC v5
+2087/TCP  VMess-WS-TLS 直连入口
+2096/TCP  VMess-WS Argo 公网边缘入口
+```
 
-## 系统要求
+`2096/TCP` 是客户端访问 Cloudflare 边缘的端口，不是 VPS 本地 Argo 源站端口。cloudflared 源站只监听随机的 `127.0.0.1:<高位端口>`，所以 UFW 和云安全组不需要开放 Argo 的 2096 入站。
 
-- 使用 systemd 的 Linux VPS。
-- Debian/Ubuntu 或使用 DNF/YUM 的常见发行版。
-- CPU：amd64、arm64、armv7 或 386。
-- root 权限。
-- VPS 能访问 GitHub Release 和 Sing-box 官方资源。
+所有默认端口都可以在创建节点时手动修改。脚本分别检查 TCP 和 UDP 占用。
 
-内核下载只接受 GitHub 正式 Release。脚本从 Release 元数据读取资产 SHA-256 摘要，校验通过后才安装。不会自动安装 `alpha`、`beta` 或其他预发布版本。
-
-## 一行安装
+## 安装与启动
 
 推荐先下载再执行：
 
 ```bash
-curl -fsSLo /tmp/mb-singbox-install.sh https://raw.githubusercontent.com/BBMCoin04/mb-singbox/main/install.sh && sudo bash /tmp/mb-singbox-install.sh
+curl -fsSLo /tmp/mb-singbox-install.sh https://raw.githubusercontent.com/BBMCoin04/mb-singbox/main/install.sh
+sudo bash /tmp/mb-singbox-install.sh
 ```
 
-快速方式：
+从本 ZIP 解压后运行 `sudo bash install.sh` 时，安装器优先使用同目录中的 `mb-singbox.sh`，不会重新下载 GitHub `main`。只单独下载 `install.sh` 时才会通过 HTTPS 获取主程序。
+
+安装后使用：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-singbox/main/install.sh | sudo bash
+sudo singbox
 ```
 
-重新打开菜单：
+安装布局：
 
-```bash
-sudo mb-singbox
+```text
+/usr/local/sbin/mb-singbox          管理器真实文件
+/usr/local/bin/singbox              快捷命令软链接
+/usr/local/lib/mb-singbox/sing-box  官方 Sing-box 内核
 ```
 
-安装器只安装管理器。进入菜单后选择“安装/更新”，再安装 Sing-box 最新稳定版。MB-Singbox 使用自己的内核路径和 systemd 服务，不覆盖系统已有的 `/usr/bin/sing-box` 或官方 `sing-box.service`。
+`mb-singbox` 仍作为兼容命令保留。安装器不会覆盖已有的 `/usr/local/bin/singbox`；若该路径被其他程序占用，会明确报错。
 
 ## 推荐部署顺序
 
-1. 先安装并运行 MB-ACME，部署需要的 TLS 证书。
+1. 使用 MB-ACME 或其他 ACME 工具部署 TLS 证书。
 2. 安装 MB-Singbox。
-3. 菜单选择 `1 -> 1`，安装 Sing-box 最新稳定版。
-4. 菜单选择 `2`，设置 VPS 公网 IP/域名并创建节点。
-5. TLS 协议从 `/etc/acme/certs/<域名>/` 中选择证书。
-6. 菜单选择 `3`，取得 Windows 配置、分享链接和二维码。
-7. 需要时在系统工具中配置 UFW、启用 BBR 或检查 AI 服务连通性。
-8. IP 不可达且已经创建 VMess-WS 时，再配置 Argo 应急入口。
+3. 选择 `1 -> 1` 安装最新稳定版 Sing-box。
+4. 选择 `2` 设置 VPS 公网 IP/域名并创建节点。
+5. 需要时选择 `7` 配置 Argo。
+6. 选择 `3` 查看分享链接和全部客户端文件路径。
+7. 选择 `10` 管理并重新实测 VMess/Argo 优选地址。
+8. 在 VPS 和云厂商防火墙中放行直连节点使用的 TCP/UDP 端口。
 
 ## 菜单
 
 ```text
-1. 安装/更新
-2. 创建节点
-3. 查看节点、桌面配置与分享链接
-4. 修改节点配置
-5. 删除节点
-6. 服务管理与日志
-7. Argo 应急隧道（VMess-WS 专属）
-8. BBR、UFW 与 AI 检测
-9. 修改客户端连接地址
-10. 彻底卸载
-0. 退出
+1.  安装/更新
+2.  创建节点
+3.  查看节点、客户端配置与分享链接
+4.  修改节点配置
+5.  删除节点
+6.  服务管理与日志
+7.  Argo 应急隧道（VMess-WS 专属）
+8.  BBR、UFW 与 AI 检测
+9.  修改客户端连接地址
+10. 客户端与 VMess/Argo 优选地址
+11. 彻底卸载
+0.  退出
 ```
 
-节点端口默认给出建议值，但允许手动输入。脚本分别检查 TCP 和 UDP 占用，所以 TCP 443 与 UDP 443 可以共存；同一传输类型的端口不能冲突。查看、修改和删除节点都使用编号选择，不需要手动输入长节点 ID；所有嵌套菜单中的 `0` 均表示返回。
+嵌套菜单中的 `0` 均表示返回。节点查看、修改和删除使用编号选择；错误编号会重新询问。
 
-## 配置与状态
+## 配置文件
 
 ```text
-/etc/mb-singbox/state.json                    唯一状态源
-/etc/mb-singbox/server.json                   当前服务端配置
+/etc/mb-singbox/state.json
+/etc/mb-singbox/server.json
 /etc/mb-singbox/clients/<节点>-windows-tun.json
 /etc/mb-singbox/clients/<节点>-windows-system-proxy.json
+/etc/mb-singbox/clients/<节点>-router-tun.json
+/etc/mb-singbox/clients/<节点>-argo-windows-tun.json
+/etc/mb-singbox/clients/<节点>-argo-windows-system-proxy.json
+/etc/mb-singbox/clients/<节点>-argo-router-tun.json
 /etc/mb-singbox/clients/windows-all-tun.json
 /etc/mb-singbox/clients/windows-all-system-proxy.json
+/etc/mb-singbox/clients/router-all-tun.json
 /etc/mb-singbox/links/<节点>.txt
+/etc/mb-singbox/links/<节点>-argo.txt
 /etc/mb-singbox/links/all.txt
 /etc/mb-singbox/qrcodes/<节点>.png
-/etc/mb-singbox/backups/                       变更前备份
+/etc/mb-singbox/backups/
 ```
 
-状态、配置和客户端文件包含节点凭据，默认只有 root 可读。Reality 私钥只存在于状态和服务端配置中，不会写入客户端、链接或二维码。
+每次创建、查看或重新生成配置时都会打印对应存储位置。目录默认只有 root 可读，因为客户端文件包含节点凭据。
 
-Windows TUN 配置同时提供本地 `mixed` 代理端口 `127.0.0.1:2080`；系统代理配置会在启动时设置系统代理，在停止时清理。配置使用 Sing-box 1.13 的新 DNS、路由和 TUN 字段，不使用旧 GeoIP/Geosite、旧 DNS server 格式或仅属于 1.14 预发布版的字段。
+## 客户端配置
 
-默认桌面端规则采用保守、可解释的分流：
+所有 JSON 都是完整 Sing-box 配置，包含：
 
-- 先执行新式 `sniff`，再用 `hijack-dns` 接管 DNS。
-- 私有 IP、局域网域名、中国域名和中国 IP 直连。
-- 其他流量默认走 `proxy` selector。
+- `log`
+- 新式 `dns.servers` 和 DNS 规则动作
+- 可直接运行的 `inbounds`
+- 节点、selector 和 direct `outbounds`
+- `sniff`、`hijack-dns` 和 rule-set 路由规则
+- cache file 与本地 Clash API
+
+配置不使用旧 `geoip/geosite` 字段、旧 DNS outbound、旧 inbound sniff、旧 TUN 地址字段或已删除的 `gso`。
+
+默认分流行为：
+
+- 私有地址、局域网域名、中国域名和中国 IP 直连。
 - 中国域名使用阿里 DoH 直连解析。
-- 其他域名使用 Cloudflare DoH，并强制经 `proxy` 查询，减少 DNS 污染和泄漏。
-- 中国规则使用 SagerNet 官方 `geosite-cn.srs`、`geoip-cn.srs` 二进制远程规则集，每天更新。
-- 开启 cache file 缓存远程规则集，避免每次启动重复下载。
-- 支持 Clash `rule`、`global`、`direct` 模式切换。
-- TUN 使用 `mixed` 栈、`auto_route` 和 `strict_route`，在 Windows 上兼顾 TCP 性能、UDP 兼容和 DNS 防泄漏。
+- 其他域名使用 Cloudflare DoH，并经 selector 代理解析。
+- 其他流量默认使用 `proxy` selector。
+- SagerNet 官方中国域名/IP二进制规则集每天更新。
 
-默认不启用广告拦截、激进 MTU、UDP 分片或 MPTCP。这些选项并非越多越快，容易误伤应用或降低复杂网络下的稳定性。
+### Windows
 
-## MB-ACME 联动
+`*-windows-tun.json` 使用 TUN 全局接管，同时提供 `127.0.0.1:2080` mixed 入站。
 
-MB-Singbox 自动发现：
+`*-windows-system-proxy.json` 设置系统代理，不接管忽略系统代理的软件。
+
+不同配置不要同时运行，否则 TUN、2080 或 9090 本地端口会冲突。
+
+### Linux/OpenWrt 软路由
+
+`*-router-tun.json` 和 `router-all-tun.json` 使用原生 Sing-box Linux TUN：
+
+- `auto_route: true`
+- `auto_redirect: true`
+- `strict_route: true`
+- `stack: "system"`
+- IPv4/IPv6 TUN 地址
+- 私网、链路本地和组播目的网段排除
+- `/tmp/mb-singbox-cache.db` 可写缓存路径
+- `route.auto_detect_interface: true` 防止代理出口回环
+
+`auto_redirect` 需要 Linux nftables。OpenWrt fw4 可与其兼容。该文件适用于直接运行原生 Sing-box 的 Linux/OpenWrt；HomeProxy 可参考 Sing-box 配置模型，但 Nikki/Momo 使用 Mihomo 模型，不能直接导入这份 JSON。
+
+## VMess/Argo 与优选 address
+
+普通 Cloudflare Tunnel 不能透明承载 Reality、Hysteria 2、TUIC 或 AnyTLS。脚本只允许 Argo 绑定 VMess-WebSocket 节点，并创建无 TLS 的本地回环源站。
+
+VMess 直连/CDN入口和 Argo 客户端配置都会将四个字段分开：
 
 ```text
-/etc/acme/certs/<域名>/fullchain.pem
-/etc/acme/certs/<域名>/key.pem
+address/server  实际连接的优选地址
+port            Cloudflare 边缘端口，默认 2096
+SNI             自己的 Argo 公网域名
+WebSocket Host  自己的 Argo 公网域名
 ```
 
-选择证书时会检查：
-
-- 文件存在且非空。
-- 证书和私钥均可被 OpenSSL 解析。
-- 证书公钥与私钥匹配。
-
-也可以手动输入其他证书的绝对路径。MB-Singbox 不直接读取 `/root/.acme.sh`，也不维护第二套 ACME 流程。
-
-如果证书由 MB-ACME 续期，建议在 MB-ACME 中把 reload 服务设为：
+内置候选地址池：
 
 ```text
-mb-singbox
+cfip.1323123.xyz
+cf.877771.xyz
+cloudflare.182682.xyz
+www.cloudflare.com
+one.one.one.one
 ```
 
-## Windows 桌面端
+生成配置时会随机抽取最多三个候选，并执行真实 TLS + WebSocket Upgrade 检查。只有在以下条件全部满足时才把候选写入 `address/server`：
 
-每个节点有两份独立配置：
+1. 使用节点自己的 TLS/Argo 域名完成证书和主机名校验。
+2. 通过候选地址连接 VMess 端口：直连/CDN默认 `2087/TCP`，Argo 默认 `2096/TCP`。
+3. 目标 WebSocket 路径返回 HTTP `101 Switching Protocols`。
 
-- `*-windows-tun.json`：适合全局接管，通常需要管理员权限。
-- `*-windows-system-proxy.json`：提供 HTTP/SOCKS 混合代理并自动设置系统代理，不接管不遵循系统代理的软件。
+如果 2087 节点是 DNS-only VPS 直连而不是 Cloudflare 代理入口，候选地址不会通过测试，配置会保留原始 VPS 地址。Argo 候选全部失败时回退到自己的 Argo 域名。脚本不会设置 `allow_insecure`，不会把第三方域名当作 SNI，也不会手工把 `cloudflare-ech.com` 当作普通 TLS SNI。
 
-汇总配置使用 `selector` 出站，默认选择第一项。配置含完整的 `log`、`dns`、`inbounds`、`outbounds`、`route` 和 Clash API 控制端口，不是只有代理出站的残缺片段。
+第三方候选域名的所有者可以随时改变 DNS，因此它们只作为经过当次实测的连接地址。可以在菜单 `10` 中关闭该功能、替换候选池、恢复默认池或重新实测生成配置。
 
-将 JSON 作为一个独立配置导入 Windows 官方 Sing-box 客户端。不同配置不要同时启动，否则本地 TUN、`2080` 或 `9090` 端口会冲突。
-
-## Argo 应急入口
-
-普通 Cloudflare Tunnel 不能透明承载 Reality、Hysteria2、TUIC 或 AnyTLS。MB-Singbox 只允许把 Argo 绑定到 VMess-WebSocket 节点，并额外创建一个仅监听 `127.0.0.1` 的无 TLS 源站入站。
-
-支持：
-
-- Named Tunnel：固定域名，适合长期备用。需要 Tunnel Token 和公网主机名。
-- Quick Tunnel：随机 `trycloudflare.com` 域名，适合临时救急。
-
-Named Tunnel 默认提供自动配置流程。除 Tunnel Token 外，自动化需要一个最小权限 Cloudflare API Token：
+Named Tunnel 自动配置需要：
 
 ```text
 Account -> Cloudflare Tunnel -> Edit
 Zone    -> DNS -> Edit
 ```
 
-脚本会从 Tunnel Token 解出 Account ID 和 Tunnel ID，保留该 Tunnel 已有的其他 ingress，再创建或更新：
+API Token 只在当前进程内使用，不写入状态或日志。Tunnel Token 保存到 root 可读文件。脚本会保留已有 ingress，再添加自己的 Public Hostname 和 CNAME。停用或卸载只清理本机 cloudflared，不删除 Cloudflare 账户中的远程 Tunnel/DNS。
+
+## 证书联动
+
+脚本自动发现：
 
 ```text
-Public Hostname -> http://127.0.0.1:<Argo 源站端口>
-DNS CNAME       -> <Tunnel ID>.cfargotunnel.com
+/etc/acme/certs/<域名>/fullchain.pem
+/etc/acme/certs/<域名>/key.pem
 ```
 
-API Token 只在内存中用于本次请求，不写入状态、文件、日志或命令行参数；Tunnel Token 保存到 root 可读文件。自动配置后脚本会发起真实 WebSocket Upgrade 检查，只有得到 HTTP `101` 才把 Argo 标记为“已验证”。DNS 尚未生效或路由错误时，只显示“本地连接器运行、公网待验证”，不会提前宣告完成。
+证书选择时检查文件存在、OpenSSL 可解析以及证书公钥与私钥匹配。也可以手动输入其他绝对路径。
 
-没有 API Token 时仍可手动配置，并在 Argo 菜单中选择“验证 Argo 公网 WebSocket”。停用或卸载只删除本机 cloudflared 服务和 Tunnel Token，不删除 Cloudflare 账户里的远程 Tunnel、ingress 或 DNS 记录。
+证书续期后建议 reload：
 
-Argo 牺牲性能换取备用可达性，不应代替 IP 正常时的直连节点。
+```bash
+systemctl reload mb-singbox
+```
 
-## UFW
+## UFW 与 BBR
 
-UFW 与 Windows 环回无关，它是 VPS 的入站防火墙。
+UFW 管理只添加或删除带 `MB-Singbox` 注释的规则。启用 UFW 前先检测并放行 SSH 端口，然后按节点类型分别开放 TCP 或 UDP。云厂商安全组仍需单独配置。
 
-MB-Singbox 可以：
-
-- UFW 未安装时询问是否安装。
-- 启用 UFW 前先检测并放行 SSH 端口。
-- 为 Reality、AnyTLS、VMess 开放 TCP。
-- 为 Hysteria2、TUIC 开放 UDP。
-- 节点增删或改端口后同步自己的规则。
-- 停止管理或卸载时只删除带 `MB-Singbox` 注释的规则。
-
-云厂商安全组或 Vultr Firewall 仍需在控制台单独放行，UFW 不能替代云防火墙。
-
-## BBR
-
-BBR 是 Linux 内核 TCP 拥塞控制，不属于 Sing-box 内核。
-
-脚本只在当前内核已经支持 BBR 时写入：
+BBR 只在当前内核已经支持时启用，并写入：
 
 ```text
 /etc/sysctl.d/99-mb-singbox-bbr.conf
 ```
 
-关闭或卸载时删除该文件并重新加载系统原有 sysctl 配置，不替换内核。BBR 主要作用于 Reality、AnyTLS、VMess 等 TCP 流量，不直接加速 Hysteria2/TUIC 的 QUIC 拥塞控制。
+BBR 主要作用于 TCP，不直接加速 Hysteria 2/TUIC 的 QUIC 拥塞控制。
 
-## AI 可用性检测
+## 更新、校验与回滚
 
-检测 ChatGPT、OpenAI API、Gemini 和 Claude 的 HTTPS 出口连通性，并报告 HTTP 状态。结果只用于诊断，不保证账号一定可用，也不会通过 WARP 或代理自动改变 VPS 出口。
-
-AI 服务能否使用主要取决于 VPS IP 的地区、信誉和服务方策略。
-
-## 更新与回滚
-
-从 `0.1.0` 首次升级到 `0.2.0` 时，建议重新运行新版 `install.sh`，因为 `0.1.0` 的菜单更新流程存在退出问题。安装器只替换管理器，不删除状态、节点、内核或证书。升级后执行：
+常用命令：
 
 ```bash
-sudo mb-singbox render
+sudo singbox install-core
+sudo singbox install-core 1.13.14
+sudo singbox check
+sudo singbox render
+sudo singbox status
+sudo singbox update-manager
 ```
 
-该命令会从现有状态重新生成服务端和全部桌面配置，逐份校验，应用服务端安全/性能字段并重启；失败会恢复旧状态和配置。
+节点变更流程：
 
-更新内核时：
-
-1. 下载指定正式版本。
-2. 校验 Release SHA-256 摘要。
-3. 使用新内核检查当前服务端配置。
-4. 检查失败则拒绝替换。
-5. 替换后重启失败则恢复旧内核。
-
-修改节点时：
-
-1. 从 `state.json` 生成候选服务端配置。
-2. 使用当前 Sing-box 执行 `check`。
-3. 生成完整桌面配置和链接。
-4. 使用当前 Sing-box 逐份检查所有桌面 JSON。
-5. 备份当前状态与服务端配置。
-6. 原子替换并重启。
-7. 服务启动失败则恢复上一版。
-
-常用 CLI：
-
-```bash
-sudo mb-singbox install-core
-sudo mb-singbox install-core 1.13.14
-sudo mb-singbox check
-sudo mb-singbox render
-sudo mb-singbox status
-sudo mb-singbox update-manager
-```
-
-## 彻底卸载
-
-菜单中的彻底卸载需要两次确认。会删除：
-
-- MB-Singbox 管理器、私有 Sing-box/cloudflared 二进制。
-- `mb-singbox.service` 和本地 Argo 服务。
-- 状态、服务端配置、桌面配置、链接、二维码、备份和日志。
-- 带 `MB-Singbox` 注释的 UFW 规则。
-- MB-Singbox 创建的 BBR sysctl 文件。
-
-不会删除：
-
-- MB-ACME。
-- `/etc/acme/certs` 中的证书。
-- Cloudflare 远程 Named Tunnel。
-- 系统其他 UFW、sysctl 或软件包。
+1. 从状态生成候选服务端配置。
+2. 使用当前 Sing-box 内核执行 `check`。
+3. 备份当前状态与服务端配置。
+4. 生成全部桌面、软路由配置和分享信息。
+5. 对每份客户端 JSON 执行 `check`。
+6. 原子替换状态和配置并重启服务。
+7. 写入或启动失败时恢复上一状态并重新生成旧客户端配置。
 
 ## 开发回归
 
-仓库内的回归脚本会下载并校验 Sing-box `1.13.14`，生成临时自签名证书和五协议测试状态，然后检查服务端、每节点桌面配置、汇总配置、现代 DNS/路由规则、远程规则集、分享链接数量及 Reality 私钥隔离：
-
 ```bash
-sudo apt-get install -y curl jq openssl tar
-./tests/regression.sh
 ./tests/behavior.sh
+./tests/regression.sh 1.13.14
 ```
 
-`behavior.sh` 还会模拟菜单返回、旧状态迁移、编号选点、Cloudflare ingress/DNS 自动配置、WebSocket `101` 验证和管理器原子更新。所有测试文件都位于 `/tmp`，结束后自动删除，不修改系统服务或真实 Cloudflare 资源。
+回归测试会下载并校验官方 Sing-box `1.13.14`，检查服务端、21 份桌面/软路由配置、现代 DNS/路由字段、默认端口、Argo address/SNI/Host 分离、分享链接数量以及 Reality 私钥隔离。

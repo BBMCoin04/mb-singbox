@@ -18,9 +18,13 @@ export MB_SINGBOX_LOG_DIR="$TEST_ROOT/log"
 export MB_SINGBOX_CORE_DIR="$TEST_ROOT/core"
 export MB_SINGBOX_BIN="$TEST_ROOT/core/sing-box"
 export MB_SINGBOX_LOCK_FILE="$TEST_ROOT/mb-singbox.lock"
+export MB_SINGBOX_QUICK_PATH="$TEST_ROOT/bin/singbox"
 
 # shellcheck disable=SC1091
 source "$PROJECT_DIR/mb-singbox.sh"
+
+# Keep this test deterministic while still verifying address/SNI separation.
+select_preferred_address() { printf 'www.cloudflare.com'; }
 
 ensure_directories
 extracted="$(download_core "${1:-1.13.14}")"
@@ -63,27 +67,28 @@ jq -n \
         public_key:$public_key,short_id:"0123456789abcdef"
       },
       {
-        id:"hy2-test",name:"Hysteria2 Test",type:"hysteria2",port:8443,
+        id:"hy2-test",name:"Hysteria2 Test",type:"hysteria2",port:443,
         password:"hy2-password",obfs_password:"hy2-obfs",tls_domain:"proxy.example.com",
         certificate_path:$cert,key_path:$key
       },
       {
-        id:"tuic-test",name:"TUIC Test",type:"tuic",port:9443,
+        id:"tuic-test",name:"TUIC Test",type:"tuic",port:8443,
         uuid:"22222222-2222-4222-8222-222222222222",password:"tuic-password",
         tls_domain:"proxy.example.com",certificate_path:$cert,key_path:$key
       },
       {
-        id:"anytls-test",name:"AnyTLS Test",type:"anytls",port:10443,
+        id:"anytls-test",name:"AnyTLS Test",type:"anytls",port:8443,
         password:"anytls-password",tls_domain:"proxy.example.com",
         certificate_path:$cert,key_path:$key
       },
       {
-        id:"vmess-test",name:"VMess Test",type:"vmess",port:11443,
+        id:"vmess-test",name:"VMess Test",type:"vmess",port:2087,
         uuid:"33333333-3333-4333-8333-333333333333",path:"/vmess-test",
         tls_domain:"proxy.example.com",certificate_path:$cert,key_path:$key
       }
     ],
-    argo:{enabled:true,mode:"named",node_id:"vmess-test",hostname:"backup.example.com",origin_port:23456,provisioned:true,verified:true,tunnel_id:"6e001ae0-26fb-407a-9540-80d5df60e54d"}
+    argo:{enabled:true,mode:"named",node_id:"vmess-test",hostname:"backup.example.com",origin_port:23456,provisioned:true,verified:true,tunnel_id:"6e001ae0-26fb-407a-9540-80d5df60e54d",public_port:2096},
+    client:{preferred_enabled:true,preferred_addresses:["www.cloudflare.com"]}
   }' > "$STATE_FILE"
 chmod 0600 "$STATE_FILE"
 
@@ -97,7 +102,7 @@ while IFS= read -r config; do
   checked=$((checked + 1))
 done < <(find "$CLIENT_DIR" -type f -name '*.json' | sort)
 
-[[ "$checked" -eq 12 ]]
+[[ "$checked" -eq 21 ]]
 [[ "$(grep -c '^[a-z0-9].*://' "$LINK_DIR/all.txt")" -eq 6 ]]
 if grep -R -F -- "$private_key" "$CLIENT_DIR" "$LINK_DIR" "$QR_DIR" >/dev/null; then
   printf 'Reality private key leaked into client outputs.\n' >&2
@@ -111,5 +116,9 @@ jq -e '.route.rule_set|map(.tag)|sort == ["geoip-cn","geosite-cn"]' "$CLIENT_DIR
 jq -e '.dns.servers|map(.tag)|sort == ["dns-direct","dns-remote"]' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
 jq -e '.experimental.cache_file.enabled==true and .inbounds[0].strict_route==true' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
 jq -e '[.. | objects | keys[]] | any(.=="geoip" or .=="geosite" or .=="inet4_address" or .=="address_resolver" or .=="dns_mode") | not' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
+jq -e '.inbounds|length==1 and .[0].type=="tun" and .[0].auto_redirect==true and .[0].stack=="system"' "$CLIENT_DIR/router-all-tun.json" >/dev/null
+jq -e '.experimental.cache_file.path=="/tmp/mb-singbox-cache.db"' "$CLIENT_DIR/router-all-tun.json" >/dev/null
+jq -e '.outbounds[0].server=="www.cloudflare.com" and .outbounds[0].server_port==2087 and .outbounds[0].tls.server_name=="proxy.example.com" and .outbounds[0].transport.headers.Host=="proxy.example.com" and .outbounds[0].tls.utls.fingerprint=="chrome"' "$CLIENT_DIR/vmess-test-router-tun.json" >/dev/null
+jq -e '.outbounds[0].server=="www.cloudflare.com" and .outbounds[0].server_port==2096 and .outbounds[0].tls.server_name=="backup.example.com" and .outbounds[0].transport.headers.Host=="backup.example.com" and .outbounds[0].tls.utls.fingerprint=="chrome"' "$CLIENT_DIR/vmess-test-argo-router-tun.json" >/dev/null
 
-printf 'Regression passed: server + %d desktop configs, modern DNS/route rules, 6 links.\n' "$checked"
+printf 'Regression passed: server + %d desktop/router configs, modern DNS/route rules, preferred VMess/Argo addresses, 6 links.\n' "$checked"
