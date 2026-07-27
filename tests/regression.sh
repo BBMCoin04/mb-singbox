@@ -102,7 +102,8 @@ while IFS= read -r config; do
   checked=$((checked + 1))
 done < <(find "$CLIENT_DIR" -type f -name '*.json' | sort)
 
-[[ "$checked" -eq 21 ]]
+[[ "$checked" -eq 3 ]]
+[[ "$(find "$CLIENT_DIR" -maxdepth 1 -type f -name '*.json' | wc -l)" -eq 3 ]]
 [[ "$(grep -c '^[a-z0-9].*://' "$LINK_DIR/all.txt")" -eq 6 ]]
 if grep -R -F -- "$private_key" "$CLIENT_DIR" "$LINK_DIR" "$QR_DIR" >/dev/null; then
   printf 'Reality private key leaked into client outputs.\n' >&2
@@ -110,15 +111,19 @@ if grep -R -F -- "$private_key" "$CLIENT_DIR" "$LINK_DIR" "$QR_DIR" >/dev/null; 
 fi
 jq -e '.inbounds|length == 6' "$SERVER_CONFIG" >/dev/null
 jq -e '[.inbounds[] | select(.type=="vless" or .type=="anytls" or (.type=="vmess" and .listen=="::")) | .tcp_fast_open] | all' "$SERVER_CONFIG" >/dev/null
-jq -e '.outbounds|map(.tag)|index("proxy") != null' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
-jq -e '.route.rules[0].action=="sniff" and .route.rules[1].action=="hijack-dns"' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
-jq -e '.route.rule_set|map(.tag)|sort == ["geoip-cn","geosite-cn"]' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
-jq -e '.dns.servers|map(.tag)|sort == ["dns-direct","dns-remote"]' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
-jq -e '.experimental.cache_file.enabled==true and .inbounds[0].strict_route==true' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
-jq -e '[.. | objects | keys[]] | any(.=="geoip" or .=="geosite" or .=="inet4_address" or .=="address_resolver" or .=="dns_mode") | not' "$CLIENT_DIR/windows-all-tun.json" >/dev/null
-jq -e '.inbounds|length==1 and .[0].type=="tun" and .[0].auto_redirect==true and .[0].stack=="system"' "$CLIENT_DIR/router-all-tun.json" >/dev/null
-jq -e '.experimental.cache_file.path=="/tmp/mb-singbox-cache.db"' "$CLIENT_DIR/router-all-tun.json" >/dev/null
-jq -e '.outbounds[0].server=="www.cloudflare.com" and .outbounds[0].server_port==2087 and .outbounds[0].tls.server_name=="proxy.example.com" and .outbounds[0].transport.headers.Host=="proxy.example.com" and .outbounds[0].tls.utls.fingerprint=="chrome"' "$CLIENT_DIR/vmess-test-router-tun.json" >/dev/null
-jq -e '.outbounds[0].server=="www.cloudflare.com" and .outbounds[0].server_port==2096 and .outbounds[0].tls.server_name=="backup.example.com" and .outbounds[0].transport.headers.Host=="backup.example.com" and .outbounds[0].tls.utls.fingerprint=="chrome"' "$CLIENT_DIR/vmess-test-argo-router-tun.json" >/dev/null
+desktop_tun="$CLIENT_DIR/sing-box-windows-tun.json"
+desktop_proxy="$CLIENT_DIR/sing-box-windows-system-proxy.json"
+router_tun="$CLIENT_DIR/sing-box-router-tun.json"
+jq -e '.outbounds|map(.tag)|index("proxy") != null' "$desktop_tun" >/dev/null
+jq -e '.route.rules[0].action=="sniff" and .route.rules[1].action=="hijack-dns"' "$desktop_tun" >/dev/null
+jq -e '.route.rule_set|map(.tag)|sort == ["geoip-cn","geosite-cn"]' "$desktop_tun" >/dev/null
+jq -e '.dns.servers|map(.tag)|sort == ["dns-direct","dns-remote"]' "$desktop_tun" >/dev/null
+jq -e '.experimental.cache_file.enabled==true and .inbounds[0].strict_route==true' "$desktop_tun" >/dev/null
+jq -e '[.. | objects | keys[]] | any(.=="geoip" or .=="geosite" or .=="inet4_address" or .=="address_resolver" or .=="dns_mode") | not' "$desktop_tun" >/dev/null
+jq -e '.inbounds|length==1 and .[0].type=="mixed" and .[0].set_system_proxy==true' "$desktop_proxy" >/dev/null
+jq -e '.inbounds|length==1 and .[0].type=="tun" and .[0].auto_redirect==true and .[0].stack=="system"' "$router_tun" >/dev/null
+jq -e '.experimental.cache_file.path=="/tmp/mb-singbox-cache.db"' "$router_tun" >/dev/null
+jq -e 'first(.outbounds[] | select(.tag=="node-vmess-test")) | .server=="www.cloudflare.com" and .server_port==2087 and .tls.server_name=="proxy.example.com" and .transport.headers.Host=="proxy.example.com" and .tls.utls.fingerprint=="chrome"' "$router_tun" >/dev/null
+jq -e 'first(.outbounds[] | select(.tag=="node-vmess-test-argo")) | .server=="www.cloudflare.com" and .server_port==2096 and .tls.server_name=="backup.example.com" and .transport.headers.Host=="backup.example.com" and .tls.utls.fingerprint=="chrome"' "$router_tun" >/dev/null
 
-printf 'Regression passed: server + %d desktop/router configs, modern DNS/route rules, preferred VMess/Argo addresses, 6 links.\n' "$checked"
+printf 'Regression passed: server + %d aggregate desktop/router configs, modern DNS/route rules, preferred VMess/Argo addresses, 6 links.\n' "$checked"

@@ -1,6 +1,6 @@
 # MB-Singbox
 
-面向 systemd Linux VPS 的 Sing-box 节点管理器。当前版本 `0.3.0` 生成可由真实 Sing-box 内核校验的服务端配置、Windows 客户端配置、Linux/OpenWrt 软路由配置、分享链接和二维码。
+面向 systemd Linux VPS 的 Sing-box 节点管理器。当前版本 `0.3.1` 生成可由真实 Sing-box 内核校验的服务端配置、Windows 客户端配置、Linux/OpenWrt 软路由配置、分享链接和二维码。
 
 脚本不捆绑订阅服务器、WARP 或流媒体解锁。状态、服务端配置和客户端配置都保存在 root 专用目录；Reality 私钥不会写入客户端文件、分享链接或二维码。
 
@@ -93,26 +93,23 @@ sudo singbox
 
 ## 配置文件
 
+客户端始终只生成三份汇总 JSON，内容根据当前全部节点自动更新：
+
 ```text
 /etc/mb-singbox/state.json
 /etc/mb-singbox/server.json
-/etc/mb-singbox/clients/<节点>-windows-tun.json
-/etc/mb-singbox/clients/<节点>-windows-system-proxy.json
-/etc/mb-singbox/clients/<节点>-router-tun.json
-/etc/mb-singbox/clients/<节点>-argo-windows-tun.json
-/etc/mb-singbox/clients/<节点>-argo-windows-system-proxy.json
-/etc/mb-singbox/clients/<节点>-argo-router-tun.json
-/etc/mb-singbox/clients/windows-all-tun.json
-/etc/mb-singbox/clients/windows-all-system-proxy.json
-/etc/mb-singbox/clients/router-all-tun.json
+/etc/mb-singbox/clients/sing-box-windows-tun.json
+/etc/mb-singbox/clients/sing-box-windows-system-proxy.json
+/etc/mb-singbox/clients/sing-box-router-tun.json
 /etc/mb-singbox/links/<节点>.txt
 /etc/mb-singbox/links/<节点>-argo.txt
 /etc/mb-singbox/links/all.txt
 /etc/mb-singbox/qrcodes/<节点>.png
+/etc/mb-singbox/qrcodes/<节点>-argo.png
 /etc/mb-singbox/backups/
 ```
 
-每次创建、查看或重新生成配置时都会打印对应存储位置。目录默认只有 root 可读，因为客户端文件包含节点凭据。
+单节点只生成分享链接和二维码，不生成单独客户端 JSON。节点增加、修改、删除或 Argo 状态变化时，三份总配置会重新生成并逐份校验。目录默认只有 root 可读，因为客户端文件包含节点凭据。
 
 ## 客户端配置
 
@@ -123,7 +120,9 @@ sudo singbox
 - 可直接运行的 `inbounds`
 - 节点、selector 和 direct `outbounds`
 - `sniff`、`hijack-dns` 和 rule-set 路由规则
-- cache file 与本地 Clash API
+- cache file 与 sing-box 本地控制兼容接口
+
+脚本不生成 Clash/Mihomo YAML 或其他 Clash 类客户端配置。`experimental.clash_api` 是 sing-box 自身提供的本地控制兼容接口，仅用于 selector、连接状态和 `Rule/Global/Direct` 模式控制，不改变 JSON 的 Sing-box 格式。
 
 配置不使用旧 `geoip/geosite` 字段、旧 DNS outbound、旧 inbound sniff、旧 TUN 地址字段或已删除的 `gso`。
 
@@ -137,15 +136,15 @@ sudo singbox
 
 ### Windows
 
-`*-windows-tun.json` 使用 TUN 全局接管，同时提供 `127.0.0.1:2080` mixed 入站。
+`sing-box-windows-tun.json` 使用 TUN 全局接管，同时提供 `127.0.0.1:2080` mixed 入站。
 
-`*-windows-system-proxy.json` 设置系统代理，不接管忽略系统代理的软件。
+`sing-box-windows-system-proxy.json` 设置系统代理，不接管忽略系统代理的软件。
 
 不同配置不要同时运行，否则 TUN、2080 或 9090 本地端口会冲突。
 
 ### Linux/OpenWrt 软路由
 
-`*-router-tun.json` 和 `router-all-tun.json` 使用原生 Sing-box Linux TUN：
+`sing-box-router-tun.json` 使用原生 Sing-box Linux TUN：
 
 - `auto_route: true`
 - `auto_redirect: true`
@@ -166,9 +165,9 @@ VMess 直连/CDN入口和 Argo 客户端配置都会将四个字段分开：
 
 ```text
 address/server  实际连接的优选地址
-port            Cloudflare 边缘端口，默认 2096
-SNI             自己的 Argo 公网域名
-WebSocket Host  自己的 Argo 公网域名
+port            VMess 直连/CDN默认 2087，Argo 默认 2096
+SNI             节点自己的 TLS/Argo 域名
+WebSocket Host  节点自己的 TLS/Argo 域名
 ```
 
 内置候选地址池：
@@ -259,4 +258,4 @@ sudo singbox update-manager
 ./tests/regression.sh 1.13.14
 ```
 
-回归测试会下载并校验官方 Sing-box `1.13.14`，检查服务端、21 份桌面/软路由配置、现代 DNS/路由字段、默认端口、Argo address/SNI/Host 分离、分享链接数量以及 Reality 私钥隔离。
+回归测试会下载并校验官方 Sing-box `1.13.14`，检查服务端、固定三份汇总桌面/软路由配置、现代 DNS/路由字段、默认端口、VMess/Argo address/SNI/Host 分离、分享链接数量以及 Reality 私钥隔离。

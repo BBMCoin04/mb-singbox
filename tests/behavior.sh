@@ -26,7 +26,7 @@ source "$PROJECT_DIR/mb-singbox.sh"
 ensure_directories
 install_manager_binary
 [[ "$(readlink -f "$MB_SINGBOX_QUICK_PATH")" == "$MB_SINGBOX_INSTALL_PATH" ]]
-[[ "$(MB_SINGBOX_NO_MAIN=0 "$MB_SINGBOX_QUICK_PATH" version)" == "mb-singbox 0.3.0" ]]
+[[ "$(MB_SINGBOX_NO_MAIN=0 "$MB_SINGBOX_QUICK_PATH" version)" == "mb-singbox 0.3.1" ]]
 
 # Nested version input must accept 0 and return to the parent menu.
 printf '2\n0\n0\n' | maintenance_menu >/dev/null
@@ -111,6 +111,6 @@ curl() {
 }
 unset MB_SINGBOX_NO_MAIN
 update_manager >/dev/null
-[[ "$($INSTALL_PATH version)" == "mb-singbox 0.3.0" ]]
+[[ "$($INSTALL_PATH version)" == "mb-singbox 0.3.1" ]]
 
 printf 'Behavior passed: menu return, state migration, preferred address, Cloudflare provisioning, manager update.\n'

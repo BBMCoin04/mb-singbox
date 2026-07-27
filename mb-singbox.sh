@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/singbox}"
@@ -407,7 +407,7 @@ install_or_update_core() {
   }
   if [[ "$(printf '%s\n' "1.13.0" "$version" | sort -V | head -n 1)" != "1.13.0" ]]; then
     rm -rf "$(dirname "$(dirname "$extracted")")"
-    error "MB-Singbox 0.3.0 最低支持 Sing-box 1.13.0，拒绝安装 ${version}。"
+    error "MB-Singbox 0.3.1 最低支持 Sing-box 1.13.0，拒绝安装 ${version}。"
     return 1
   fi
 
@@ -778,7 +778,7 @@ select_preferred_address() {
 }
 
 generate_outputs() {
-  local state="$1" temp_root server client_server node_json id name outbounds_file link link_file argo_hostname=""
+  local state="$1" temp_root server client_server node_json id name link link_file argo_hostname=""
   local argo_address="" argo_path="" argo_port=2096
   temp_root="$(mktemp -d "${ROOT_DIR}/.outputs.XXXXXX")" || return 1
   install -d -m 0700 "$temp_root/clients" "$temp_root/links" "$temp_root/qrcodes"
@@ -797,11 +797,6 @@ generate_outputs() {
     if [[ "$(jq -r '.type' <<<"$node_json")" == "vmess" ]]; then
       client_server="$(select_preferred_address "$state" "$(jq -r '.tls_domain' <<<"$node_json")" "$(jq -r '.port' <<<"$node_json")" "$(jq -r '.path' <<<"$node_json")" "$server")"
     fi
-    outbounds_file="$temp_root/${id}-outbounds.json"
-    jq -n --argjson outbound "$(make_outbound_json "$node_json" "$client_server")" '[$outbound]' > "$outbounds_file"
-    render_client_config "$outbounds_file" tun "$temp_root/clients/${id}-windows-tun.json" || { rm -rf "$temp_root"; return 1; }
-    render_client_config "$outbounds_file" system-proxy "$temp_root/clients/${id}-windows-system-proxy.json" || { rm -rf "$temp_root"; return 1; }
-    render_client_config "$outbounds_file" router "$temp_root/clients/${id}-router-tun.json" || { rm -rf "$temp_root"; return 1; }
     link="$(node_share_link "$node_json" "$client_server")"
     link_file="$temp_root/links/${id}.txt"
     printf '%s\n' "$link" > "$link_file"
@@ -823,11 +818,6 @@ generate_outputs() {
       name="$(jq -r '.name' <<<"$node_json")"
       argo_path="$(jq -r '.path' <<<"$node_json")"
       argo_address="$(select_preferred_address "$state" "$argo_hostname" "$argo_port" "$argo_path")"
-      outbounds_file="$temp_root/${id}-argo-outbounds.json"
-      jq -n --argjson outbound "$(make_outbound_json "$node_json" "$server" "$argo_hostname" "$argo_address" "$argo_port")" '[$outbound]' > "$outbounds_file"
-      render_client_config "$outbounds_file" tun "$temp_root/clients/${id}-argo-windows-tun.json" || { rm -rf "$temp_root"; return 1; }
-      render_client_config "$outbounds_file" system-proxy "$temp_root/clients/${id}-argo-windows-system-proxy.json" || { rm -rf "$temp_root"; return 1; }
-      render_client_config "$outbounds_file" router "$temp_root/clients/${id}-argo-router-tun.json" || { rm -rf "$temp_root"; return 1; }
       link="$(node_share_link "$node_json" "$server" "$argo_hostname" "$argo_address" "$argo_port")"
       printf '%s\n' "$link" > "$temp_root/links/${id}-argo.txt"
       printf '%s-Argo\n%s\n\n' "$name" "$link" >> "$temp_root/links/all.txt"
@@ -838,11 +828,11 @@ generate_outputs() {
   fi
 
   if [[ "$(jq 'length' "$temp_root/all-outbounds.json")" -gt 0 ]]; then
-    render_client_config "$temp_root/all-outbounds.json" tun "$temp_root/clients/windows-all-tun.json" || { rm -rf "$temp_root"; return 1; }
-    render_client_config "$temp_root/all-outbounds.json" system-proxy "$temp_root/clients/windows-all-system-proxy.json" || { rm -rf "$temp_root"; return 1; }
-    render_client_config "$temp_root/all-outbounds.json" router "$temp_root/clients/router-all-tun.json" || { rm -rf "$temp_root"; return 1; }
+    render_client_config "$temp_root/all-outbounds.json" tun "$temp_root/clients/sing-box-windows-tun.json" || { rm -rf "$temp_root"; return 1; }
+    render_client_config "$temp_root/all-outbounds.json" system-proxy "$temp_root/clients/sing-box-windows-system-proxy.json" || { rm -rf "$temp_root"; return 1; }
+    render_client_config "$temp_root/all-outbounds.json" router "$temp_root/clients/sing-box-router-tun.json" || { rm -rf "$temp_root"; return 1; }
   fi
-  rm -f "$temp_root"/*-outbounds.json "$temp_root/all-outbounds.json"
+  rm -f "$temp_root/all-outbounds.json"
 
   local client_config
   while IFS= read -r client_config; do
@@ -1177,9 +1167,9 @@ show_node_result() {
   argo_link_file="${LINK_DIR}/${id}-argo.txt"
   printf '\n%s节点详情%s\n' "$C_BOLD" "$C_RESET"
   printf '名称：%s\n协议：%s\n端口：%s\n' "$name" "$type" "$port"
-  printf 'Windows TUN：%s/%s-windows-tun.json\n' "$CLIENT_DIR" "$id"
-  printf 'Windows 系统代理：%s/%s-windows-system-proxy.json\n' "$CLIENT_DIR" "$id"
-  printf 'Linux/OpenWrt 软路由：%s/%s-router-tun.json\n' "$CLIENT_DIR" "$id"
+  printf 'Windows TUN 总配置：%s/sing-box-windows-tun.json\n' "$CLIENT_DIR"
+  printf 'Windows 系统代理总配置：%s/sing-box-windows-system-proxy.json\n' "$CLIENT_DIR"
+  printf 'Linux/OpenWrt 软路由总配置：%s/sing-box-router-tun.json\n' "$CLIENT_DIR"
   if [[ -s "$link_file" ]]; then
     printf '\n直连分享链接：\n'
     cat "$link_file"
@@ -1189,10 +1179,6 @@ show_node_result() {
     fi
   fi
   if [[ -s "$argo_link_file" ]]; then
-    printf '\nArgo 独立客户端配置：\n'
-    printf 'Windows TUN：%s/%s-argo-windows-tun.json\n' "$CLIENT_DIR" "$id"
-    printf 'Windows 系统代理：%s/%s-argo-windows-system-proxy.json\n' "$CLIENT_DIR" "$id"
-    printf 'Linux/OpenWrt 软路由：%s/%s-argo-router-tun.json\n' "$CLIENT_DIR" "$id"
     printf '\nArgo 应急分享链接：\n'
     cat "$argo_link_file"
     if command -v qrencode >/dev/null 2>&1 && [[ -t 1 ]]; then
@@ -1211,7 +1197,7 @@ list_nodes() {
   fi
   jq -r '.nodes | to_entries[] | [(.key+1|tostring), .value.name, .value.type, (.value.port|tostring), (if (.value.type=="hysteria2" or .value.type=="tuic") then "UDP" else "TCP" end), .value.id] | @tsv' "$STATE_FILE" | \
     awk -F '\t' '{printf "%2s. %-18s  %-10s  %5s/%-3s  ID=%s\n", $1, $2, $3, $4, $5, $6}'
-  printf '\n客户端汇总配置：\n  %s/windows-all-tun.json\n  %s/windows-all-system-proxy.json\n  %s/router-all-tun.json\n' "$CLIENT_DIR" "$CLIENT_DIR" "$CLIENT_DIR"
+  printf '\n客户端总配置：\n  %s/sing-box-windows-tun.json\n  %s/sing-box-windows-system-proxy.json\n  %s/sing-box-router-tun.json\n' "$CLIENT_DIR" "$CLIENT_DIR" "$CLIENT_DIR"
   printf '全部分享链接：%s/all.txt\n' "$LINK_DIR"
   if jq -e '.argo.enabled' "$STATE_FILE" >/dev/null; then
     printf 'Argo：%s，%s，%s\n' \
