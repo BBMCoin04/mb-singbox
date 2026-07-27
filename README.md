@@ -1,6 +1,6 @@
 # MB-Singbox
 
-面向 systemd Linux VPS 的 Sing-box 节点管理器。当前版本 `0.3.2` 生成可由真实 Sing-box 内核校验的服务端配置、Windows 客户端配置、Linux/OpenWrt 软路由配置、分享链接和二维码。
+面向 systemd Linux VPS 的 Sing-box 节点管理器。当前版本 `0.3.3` 生成可由真实 Sing-box 内核校验的服务端配置、Windows 客户端配置、Linux/OpenWrt 软路由配置、分享链接和二维码。
 
 脚本不捆绑订阅服务器、WARP 或流媒体解锁。状态、服务端配置和客户端配置都保存在 root 专用目录；Reality 私钥不会写入客户端文件、分享链接或二维码。
 
@@ -167,6 +167,8 @@ journalctl -u mb-singbox -n 100 --no-pager
 - `route.auto_detect_interface: true` 防止代理出口回环
 
 `auto_redirect` 需要 Linux nftables。OpenWrt fw4 可与其兼容。该文件适用于直接运行原生 Sing-box 的 Linux/OpenWrt；HomeProxy 可参考 Sing-box 配置模型，但 Nikki/Momo 使用 Mihomo 模型，不能直接导入这份 JSON。
+
+TUIC v5 的服务端、Sing-box 客户端 JSON 和分享链接统一显式使用 `ALPN h3`。如果客户端发送 `h3` 而服务端未配置相同 ALPN，UDP 数据包虽然会双向传输，但 QUIC/TLS 会在 TUIC 认证前失败。
 
 ## VMess/Argo 与优选 address
 

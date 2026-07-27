@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.3.2"
+VERSION="0.3.3"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/singbox}"
@@ -480,7 +480,7 @@ render_server_config() {
       reuse_addr: true,
       users: [{name: .name, uuid: .uuid, password: .password}],
       congestion_control: "bbr", zero_rtt_handshake: false, heartbeat: "10s",
-      tls: {enabled: true, certificate_path: .certificate_path, key_path: .key_path}
+      tls: {enabled: true, alpn: ["h3"], certificate_path: .certificate_path, key_path: .key_path}
     }
     elif .type == "anytls" then {
       type: "anytls", tag: ("in-" + .id), listen: "::", listen_port: .port,
@@ -552,7 +552,7 @@ make_outbound_json() {
       connect_timeout: "10s",
       uuid: $n.uuid, password: $n.password,
       congestion_control: "bbr", udp_relay_mode: "native", zero_rtt_handshake: false,
-      tls: {enabled: true, server_name: $n.tls_domain}
+      tls: {enabled: true, server_name: $n.tls_domain, alpn: ["h3"]}
     }
     elif $n.type == "anytls" then {
       type: "anytls", tag: ("node-" + $n.id), server: $server, server_port: $n.port,
