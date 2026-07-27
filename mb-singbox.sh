@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.4.1"
+VERSION="0.4.2"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/singbox}"
@@ -2491,18 +2491,18 @@ add_desired_ufw_rules() {
 }
 
 remove_obsolete_ufw_rules() {
-  local line number comment wanted desired numbers=""
-  local -a desired_comments=()
-  mapfile -t desired_comments < <(desired_ufw_rules | cut -f3-)
+  local line number rule wanted desired numbers=""
+  local -a desired_rules=()
+  mapfile -t desired_rules < <(desired_ufw_rules | awk -F '\t' '{print $2 "/" $1}')
   while IFS= read -r line; do
     [[ "$line" == *"# MB-Singbox"* ]] || continue
     number="$(sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' <<<"$line")"
-    comment="${line##*# }"
+    rule="$(sed -n 's/^\[[[:space:]]*[0-9][0-9]*\][[:space:]]*\([^[:space:]]*\).*/\1/p' <<<"$line")"
     wanted=0
-    for desired in "${desired_comments[@]}"; do
-      [[ "$comment" == "$desired" ]] && { wanted=1; break; }
+    for desired in "${desired_rules[@]}"; do
+      [[ "$rule" == "$desired" ]] && { wanted=1; break; }
     done
-    (( wanted )) || numbers+="${number}"$'\n'
+    [[ -z "$number" ]] || (( wanted )) || numbers+="${number}"$'\n'
   done < <(LC_ALL=C ufw status numbered 2>/dev/null)
   while IFS= read -r number; do
     [[ -z "$number" ]] || ufw --force delete "$number" >/dev/null || return 1

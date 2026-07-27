@@ -1,6 +1,6 @@
 # MB-Singbox
 
-MB-Singbox 是一个面向 systemd Linux VPS 的 Sing-box 节点管理脚本。当前管理器版本：`0.4.1`。
+MB-Singbox 是一个面向 systemd Linux VPS 的 Sing-box 节点管理脚本。当前管理器版本：`0.4.2`。
 
 支持以下服务端节点：
 
@@ -137,7 +137,7 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 
 ## 更新与备份
 
-从 `0.3.x` 更新到 `0.4.1` 会保留节点、UUID、密码、Reality 密钥、证书路径和 Argo 配置。
+从 `0.3.x` 更新到 `0.4.2` 会保留节点、UUID、密码、Reality 密钥、证书路径和 Argo 配置。
 
 脚本修改配置前会执行校验并创建备份，默认保留最近 20 份：
 
