@@ -1,6 +1,6 @@
 # MB sing-box 管理器
 
-MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.4.3`。
+MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.5.0`。
 
 命名约定：`MB` 只作为项目系列前缀，不另行展开；用户界面统一使用“MB sing-box 管理器”，技术标识统一使用 `mb-singbox`，上游内核统一写作 `sing-box`。主命令是 `mb-singbox`；旧命令 `singbox` 仅作为兼容别名保留。
 
@@ -21,7 +21,7 @@ MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理
 - 创建 Hysteria2、TUIC、AnyTLS、VMess 前，需要准备受系统信任的 TLS 证书
 - 证书建议放在 `/etc/acme/certs/<域名>/`，不要放在 `/root` 或 `/home`
 
-Reality 不需要证书。
+Reality 不需要证书。新建 Reality 节点的默认握手域名是 `apple.com`，创建时仍会执行临时端到端兼容性校验，也可以手动输入其他域名。升级不会修改现有 Reality 节点的握手域名和客户端配置。
 
 ## 安装
 
@@ -154,7 +154,7 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 
 ## 更新与备份
 
-从 `0.3.x` 或 `0.4.2` 更新到 `0.4.3` 会保留节点、UUID、密码、Reality 密钥、证书路径、Argo 配置和原有 `singbox` 兼容命令。
+从 `0.3.x`、`0.4.2` 或 `0.4.3` 更新到 `0.5.0` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
 
 脚本修改配置前会执行校验并创建备份，默认保留最近 20 份：
 

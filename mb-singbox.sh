@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.4.3"
+VERSION="0.5.0"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/mb-singbox}"
@@ -26,10 +26,13 @@ SINGBOX_HOME="${MB_SINGBOX_CORE_DIR:-/usr/local/lib/mb-singbox}"
 SINGBOX_BIN="${MB_SINGBOX_BIN:-${SINGBOX_HOME}/sing-box}"
 SERVICE_FILE="${MB_SINGBOX_SERVICE_FILE:-/etc/systemd/system/mb-singbox.service}"
 SERVICE_NAME="mb-singbox.service"
-DEFAULT_REALITY_TARGET="www.cloudflare.com"
+MAIN_SERVICE_DESCRIPTION="MB sing-box proxy service"
+DEFAULT_REALITY_TARGET="apple.com"
 CLOUDFLARED_BIN="${MB_SINGBOX_CLOUDFLARED_BIN:-${SINGBOX_HOME}/cloudflared}"
 ARGO_SERVICE_FILE="${MB_SINGBOX_ARGO_SERVICE_FILE:-/etc/systemd/system/mb-singbox-argo.service}"
 ARGO_SERVICE_NAME="mb-singbox-argo.service"
+ARGO_NAMED_DESCRIPTION="MB sing-box Cloudflare Named Tunnel"
+ARGO_QUICK_DESCRIPTION="MB sing-box Cloudflare Quick Tunnel"
 ARGO_TOKEN_FILE="${ROOT_DIR}/argo-token"
 BBR_FILE="${MB_SINGBOX_BBR_FILE:-/etc/sysctl.d/99-mb-singbox-bbr.conf}"
 LOCK_FILE="${MB_SINGBOX_LOCK_FILE:-/run/lock/mb-singbox.lock}"
@@ -563,7 +566,7 @@ write_service_file() {
   temporary="$(mktemp /tmp/mb-singbox-service.XXXXXX)" || return 1
   cat > "$temporary" <<EOF
 [Unit]
-Description=MB sing-box manager proxy service
+Description=${MAIN_SERVICE_DESCRIPTION}
 Wants=network-online.target
 After=network-online.target nss-lookup.target
 
@@ -597,6 +600,56 @@ EOF
   fi
   rm -f -- "$temporary"
   systemctl daemon-reload
+}
+
+unit_description() {
+  [[ -f "$1" ]] || return 1
+  awk -F= '/^Description=/{sub(/^Description=/, ""); print; exit}' "$1"
+}
+
+expected_argo_description() {
+  case "$(jq -r '.argo.mode // ""' "$STATE_FILE" 2>/dev/null)" in
+    named) printf '%s\n' "$ARGO_NAMED_DESCRIPTION" ;;
+    quick) printf '%s\n' "$ARGO_QUICK_DESCRIPTION" ;;
+    *) return 1 ;;
+  esac
+}
+
+UNIT_DESCRIPTION_CHANGED=0
+refresh_unit_description() {
+  local file="$1" expected="$2" current temporary
+  [[ -f "$file" ]] || return 0
+  current="$(unit_description "$file" 2>/dev/null || true)"
+  [[ "$current" != "$expected" ]] || return 0
+  temporary="$(mktemp "$(dirname "$file")/.$(basename "$file").description.XXXXXX")" || return 1
+  if ! awk -v description="$expected" '
+    BEGIN {updated=0}
+    /^Description=/ {
+      if (!updated) {print "Description=" description; updated=1}
+      next
+    }
+    {print}
+    END {if (!updated) exit 42}
+  ' "$file" > "$temporary" || ! atomic_install_file "$temporary" "$file" 0644; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  rm -f -- "$temporary"
+  UNIT_DESCRIPTION_CHANGED=1
+}
+
+refresh_service_metadata() {
+  local argo_description=""
+  UNIT_DESCRIPTION_CHANGED=0
+  refresh_unit_description "$SERVICE_FILE" "$MAIN_SERVICE_DESCRIPTION" || return 1
+  if [[ -f "$ARGO_SERVICE_FILE" ]]; then
+    argo_description="$(expected_argo_description 2>/dev/null || true)"
+    [[ -z "$argo_description" ]] || refresh_unit_description "$ARGO_SERVICE_FILE" "$argo_description" || return 1
+  fi
+  if (( UNIT_DESCRIPTION_CHANGED )); then
+    systemctl daemon-reload || return 1
+    ok "systemd 服务描述已迁移为统一名称；运行中的服务未重启。"
+  fi
 }
 
 restore_core_binary() {
@@ -2041,7 +2094,7 @@ write_argo_service() {
   if [[ "$mode" == "named" ]]; then
     cat > "$temporary" <<EOF
 [Unit]
-Description=MB sing-box manager Cloudflare Named Tunnel
+Description=${ARGO_NAMED_DESCRIPTION}
 Wants=network-online.target ${SERVICE_NAME}
 After=network-online.target ${SERVICE_NAME}
 
@@ -2066,7 +2119,7 @@ EOF
   else
     cat > "$temporary" <<EOF
 [Unit]
-Description=MB sing-box manager Cloudflare Quick Tunnel
+Description=${ARGO_QUICK_DESCRIPTION}
 Wants=network-online.target ${SERVICE_NAME}
 After=network-online.target ${SERVICE_NAME}
 
@@ -3171,6 +3224,7 @@ show_status_line() {
 
 doctor() {
   local installed_version="未安装" installed_hash="未知" remote_version="无法获取" quick_target="不存在" legacy_target="不存在" service_state="未知"
+  local service_description="不存在" argo_description="不存在" expected_argo=""
   [[ ! -x "$INSTALL_PATH" ]] || installed_version="$("$INSTALL_PATH" version 2>/dev/null || printf '无法执行')"
   [[ ! -f "$INSTALL_PATH" ]] || installed_hash="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || printf '未知')"
   [[ ! -e "$QUICK_PATH" && ! -L "$QUICK_PATH" ]] || quick_target="$(readlink -f "$QUICK_PATH" 2>/dev/null || printf '无法解析')"
@@ -3194,6 +3248,15 @@ doctor() {
   fi
   service_state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
   printf '服务：%s\n' "${service_state:-未知}"
+  service_description="$(unit_description "$SERVICE_FILE" 2>/dev/null || printf '不存在')"
+  printf '主服务描述：%s（%s）\n' "$service_description" \
+    "$(if [[ "$service_description" == "$MAIN_SERVICE_DESCRIPTION" ]]; then printf '已统一'; else printf '待迁移'; fi)"
+  if [[ -f "$ARGO_SERVICE_FILE" ]]; then
+    argo_description="$(unit_description "$ARGO_SERVICE_FILE" 2>/dev/null || printf '不存在')"
+    expected_argo="$(expected_argo_description 2>/dev/null || true)"
+    printf 'Argo 服务描述：%s（%s）\n' "$argo_description" \
+      "$(if [[ -n "$expected_argo" && "$argo_description" == "$expected_argo" ]]; then printf '已统一'; else printf '待迁移'; fi)"
+  fi
   printf '防火墙模式：%s；UFW=%s；firewalld=%s\n' \
     "$(firewall_mode_label)" \
     "$(if ufw_is_active; then printf '运行中'; else printf '未运行'; fi)" \
@@ -3226,6 +3289,7 @@ main_menu() {
   install_dependencies || return 1
   init_state || return 1
   install_manager_binary || return 1
+  refresh_service_metadata || warn "systemd 服务描述自动迁移失败，可运行 doctor 检查。"
   while true; do
     banner
     show_status_line
