@@ -1477,7 +1477,7 @@ choose_port() {
     if ! validate_port "$input"; then
       error "端口必须是 1 到 65535 的整数。"
     elif port_in_state "$input" "$network"; then
-      error "${network^^} ${input} 已被另一个 MB sing-box 管理器 节点使用。"
+      error "${network^^} ${input} 已被另一个 mb-singbox 节点使用。"
     elif port_listening "$input" "$network"; then
       error "系统中已有程序监听 ${network^^} ${input}。"
     else
@@ -1815,7 +1815,7 @@ choose_port_for_node() {
         (if $network == "udp" then (.type=="hysteria2" or .type=="tuic") else (.type=="reality" or .type=="anytls" or .type=="vmess") end)
       ) or (.argo.enabled and $network=="tcp" and .argo.origin_port==$port)
     ' "$STATE_FILE" >/dev/null; then
-      error "${network^^} ${input} 已被另一个 MB sing-box 管理器 入站使用。"
+      error "${network^^} ${input} 已被另一个 mb-singbox 入站使用。"
     elif port_listening "$input" "$network"; then
       error "系统中已有程序监听 ${network^^} ${input}。"
     else
@@ -2694,7 +2694,7 @@ show_bbr_status() {
   printf '当前拥塞控制：%s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
   printf '可用算法：%s\n' "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || printf '未知')"
   printf '默认队列：%s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '未知')"
-  [[ -f "$BBR_FILE" ]] && printf 'MB sing-box 管理器 BBR：已配置\n' || printf 'MB sing-box 管理器 BBR：未配置\n'
+  [[ -f "$BBR_FILE" ]] && printf 'MB sing-box 管理器的 BBR：已配置\n' || printf 'MB sing-box 管理器的 BBR：未配置\n'
 }
 
 enable_bbr() {
@@ -2735,7 +2735,7 @@ EOF
 }
 
 disable_bbr() {
-  [[ -f "$BBR_FILE" ]] || { info "MB sing-box 管理器 没有创建 BBR 配置。"; return 0; }
+  [[ -f "$BBR_FILE" ]] || { info "MB sing-box 管理器没有创建 BBR 配置。"; return 0; }
   rm -f "$BBR_FILE"
   sysctl --system >/dev/null || true
   ok "已删除 MB sing-box 管理器的 BBR 配置，并重新加载系统原有 sysctl 配置。"
@@ -3048,7 +3048,7 @@ update_manager() {
   info "正在从 ${MANAGER_REPO}@${MANAGER_REF} 检查管理器更新..."
   if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$source_url" -o "$candidate"; then
     rm -f "$candidate" "$backup"
-    error "无法下载 MB sing-box 管理器 主程序。请确认仓库和分支已经发布。"
+    error "无法下载 MB sing-box 管理器主程序。请确认仓库和分支已经发布。"
     return 1
   fi
   if [[ ! -s "$candidate" ]] || ! bash -n "$candidate" || ! grep -q '^PROGRAM="mb-singbox"$' "$candidate"; then
@@ -3205,7 +3205,17 @@ doctor() {
 
 banner() {
   [[ -t 1 ]] && clear || true
-  printf '%s%sMB sing-box 管理器 %s%s\n' "$C_BOLD" "$C_CYAN" "$VERSION" "$C_RESET"
+  printf '%s%s' "$C_BOLD" "$C_CYAN"
+  cat <<'EOF'
+ __  __  ____        ____  _             _                
+|  \/  || __ )      / ___|(_)_ __   __ _| |__   _____  __
+| |\/| ||  _ \ _____\___ \| | '_ \ / _` | '_ \ / _ \ \/ /
+| |  | || |_) |_____|___) | | | | | (_| | |_) | (_) >  < 
+|_|  |_||____/     |____/|_|_| |_|\__, |_.__/ \___/_/\_\
+                                  |___/                   
+EOF
+  printf '%s' "$C_RESET"
+  printf '%sMB sing-box 管理器 %s%s\n' "$C_BOLD" "$VERSION" "$C_RESET"
   printf '轻量、可校验的 sing-box 节点管理器\n\n'
 }
 

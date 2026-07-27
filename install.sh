@@ -74,7 +74,7 @@ if [[ -z "$BUNDLED_SOURCE" && "$SOURCE_URL" != https://* ]]; then
 fi
 
 TEMP_FILE="$(mktemp /tmp/mb-singbox.XXXXXX.sh)" || exit 1
-info "MB sing-box 管理器 引导安装器 ${INSTALLER_VERSION}"
+info "MB sing-box 管理器引导安装器 ${INSTALLER_VERSION}"
 if [[ -n "$BUNDLED_SOURCE" ]]; then
   info "正在使用安装包内的 mb-singbox.sh"
   if ! cp "$BUNDLED_SOURCE" "$TEMP_FILE"; then
@@ -108,7 +108,7 @@ if ! bash -n "$TEMP_FILE"; then
   exit 1
 fi
 if ! grep -q '^PROGRAM="mb-singbox"$' "$TEMP_FILE"; then
-  error "下载内容不是预期的 MB sing-box 管理器 主程序，拒绝安装。"
+  error "下载内容不是预期的 MB sing-box 管理器主程序，拒绝安装。"
   exit 1
 fi
 MANAGER_VERSION="$(awk -F '"' '/^VERSION="[0-9]/{print $2; exit}' "$TEMP_FILE")"
