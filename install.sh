@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-INSTALLER_VERSION="0.5.2"
+INSTALLER_VERSION="0.5.3"
 DEFAULT_REPO="BBMCoin04/mb-singbox"
 REPO="${MB_SINGBOX_REPO:-$DEFAULT_REPO}"
 REF="${MB_SINGBOX_REF:-main}"
@@ -13,6 +13,7 @@ QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/mb-singbox}"
 LEGACY_QUICK_PATH="${MB_SINGBOX_LEGACY_QUICK_PATH:-/usr/local/bin/singbox}"
 CACHE_BUST="$(date +%s)"
 SOURCE_URL="${MB_SINGBOX_SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/mb-singbox.sh?ts=${CACHE_BUST}}"
+API_URL="https://api.github.com/repos/${REPO}/contents/mb-singbox.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
 BUNDLED_SOURCE=""
 if [[ -z "${MB_SINGBOX_SOURCE_URL+x}" && -n "$SCRIPT_DIR" && -s "${SCRIPT_DIR}/mb-singbox.sh" ]]; then
@@ -82,12 +83,34 @@ if [[ -n "$BUNDLED_SOURCE" ]]; then
     exit 1
   fi
 else
-  info "正在下载 ${SOURCE_URL}"
   if command -v curl >/dev/null 2>&1; then
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$SOURCE_URL" -o "$TEMP_FILE"
-    download_rc=$?
+    if [[ -n "${MB_SINGBOX_SOURCE_URL+x}" ]]; then
+      info "正在下载 ${SOURCE_URL}"
+      curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL \
+        -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+        "$SOURCE_URL" -o "$TEMP_FILE"
+      download_rc=$?
+    else
+      info "正在通过 GitHub API 下载 ${REPO}@${REF}"
+      if curl --proto '=https' --tlsv1.2 --retry 2 --retry-delay 1 -fsSL \
+          -H 'Accept: application/vnd.github.raw+json' \
+          -H 'X-GitHub-Api-Version: 2022-11-28' \
+          -H 'Cache-Control: no-cache' \
+          --get --data-urlencode "ref=${REF}" --data-urlencode "ts=${CACHE_BUST}" \
+          "$API_URL" -o "$TEMP_FILE" &&
+         [[ -s "$TEMP_FILE" ]] && bash -n "$TEMP_FILE" && grep -q '^PROGRAM="mb-singbox"$' "$TEMP_FILE"; then
+        download_rc=0
+      else
+        info "GitHub API 下载失败，正在尝试 ${SOURCE_URL}"
+        curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL \
+          -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+          "$SOURCE_URL" -o "$TEMP_FILE"
+        download_rc=$?
+      fi
+    fi
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$TEMP_FILE" "$SOURCE_URL"
+    info "正在下载 ${SOURCE_URL}"
+    wget --header='Cache-Control: no-cache' --header='Pragma: no-cache' -qO "$TEMP_FILE" "$SOURCE_URL"
     download_rc=$?
   else
     error "需要 curl 或 wget 才能下载安装。"

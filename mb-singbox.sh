@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.5.2"
+VERSION="0.5.3"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/mb-singbox}"
@@ -3118,31 +3118,58 @@ install_manager_binary() {
 }
 
 update_manager() {
-  local stamp source_url candidate backup new_version
+  local stamp api_url raw_url candidate backup new_version download_source=""
   require_root
   command -v curl >/dev/null 2>&1 || install_dependencies || return 1
   stamp="$(date +%s)"
-  source_url="${MANAGER_RAW_BASE}/mb-singbox.sh?ts=${stamp}"
+  api_url="https://api.github.com/repos/${MANAGER_REPO}/contents/mb-singbox.sh"
+  raw_url="${MANAGER_RAW_BASE}/mb-singbox.sh?ts=${stamp}"
   candidate="$(mktemp /tmp/mb-singbox-update.XXXXXX.sh)" || return 1
   backup="$(mktemp /tmp/mb-singbox-backup.XXXXXX.sh)" || { rm -f "$candidate"; return 1; }
 
   info "正在从 ${MANAGER_REPO}@${MANAGER_REF} 检查管理器更新..."
-  if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$source_url" -o "$candidate"; then
-    rm -f "$candidate" "$backup"
-    error "无法下载 MB sing-box 管理器主程序。请确认仓库和分支已经发布。"
-    return 1
+  if curl --proto '=https' --tlsv1.2 --retry 2 --retry-delay 1 -fsSL \
+      -H 'Accept: application/vnd.github.raw+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      -H 'Cache-Control: no-cache' \
+      --get --data-urlencode "ref=${MANAGER_REF}" --data-urlencode "ts=${stamp}" \
+      "$api_url" -o "$candidate" &&
+     [[ -s "$candidate" ]] && bash -n "$candidate" && grep -q '^PROGRAM="mb-singbox"$' "$candidate"; then
+    download_source="GitHub API"
+  else
+    warn "GitHub API 下载失败，正在尝试 raw.githubusercontent.com。"
+    if curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL \
+        -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+        "$raw_url" -o "$candidate" &&
+       [[ -s "$candidate" ]] && bash -n "$candidate" && grep -q '^PROGRAM="mb-singbox"$' "$candidate"; then
+      download_source="GitHub Raw"
+    else
+      rm -f "$candidate" "$backup"
+      error "无法下载 MB sing-box 管理器主程序。请确认仓库和分支已经发布。"
+      return 1
+    fi
   fi
+  info "更新源：${download_source}"
   if [[ ! -s "$candidate" ]] || ! bash -n "$candidate" || ! grep -q '^PROGRAM="mb-singbox"$' "$candidate"; then
     rm -f "$candidate" "$backup"
     error "下载内容未通过程序标识和 Bash 语法检查。"
     return 1
   fi
   new_version="$(awk -F '"' '/^VERSION="[0-9]/ {print $2; exit}' "$candidate")"
-  [[ -n "$new_version" ]] || {
+  [[ "$new_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
     rm -f "$candidate" "$backup"
     error "无法识别下载版本，拒绝更新。"
     return 1
   }
+  if [[ "$new_version" == "$VERSION" ]]; then
+    rm -f "$candidate" "$backup"
+    if [[ "$download_source" == "GitHub API" ]]; then
+      ok "当前已是最新版：${VERSION}"
+      return 0
+    fi
+    warn "Raw 下载结果与当前版本相同，但 GitHub API 不可用，无法确认远端最新版；未覆盖本地文件。"
+    return 1
+  fi
   if [[ "$(printf '%s\n' "$VERSION" "$new_version" | sort -V | head -n 1)" != "$VERSION" ]]; then
     rm -f "$candidate" "$backup"
     error "远程版本 ${new_version} 低于当前版本 ${VERSION}，拒绝降级。"
@@ -3251,14 +3278,31 @@ show_status_line() {
 }
 
 doctor() {
-  local installed_version="未安装" installed_hash="未知" remote_version="无法获取" quick_target="不存在" legacy_target="不存在" service_state="未知"
-  local service_description="不存在" argo_description="不存在" expected_argo=""
+  local installed_version="未安装" installed_hash="未知" remote_version="无法获取" remote_source="不可用"
+  local quick_target="不存在" legacy_target="不存在" service_state="未知"
+  local service_description="不存在" argo_description="不存在" expected_argo="" stamp api_url
   [[ ! -x "$INSTALL_PATH" ]] || installed_version="$("$INSTALL_PATH" version 2>/dev/null || printf '无法执行')"
   [[ ! -f "$INSTALL_PATH" ]] || installed_hash="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || printf '未知')"
   [[ ! -e "$QUICK_PATH" && ! -L "$QUICK_PATH" ]] || quick_target="$(readlink -f "$QUICK_PATH" 2>/dev/null || printf '无法解析')"
   [[ ! -e "$LEGACY_QUICK_PATH" && ! -L "$LEGACY_QUICK_PATH" ]] || legacy_target="$(readlink -f "$LEGACY_QUICK_PATH" 2>/dev/null || printf '无法解析')"
   if command -v curl >/dev/null 2>&1; then
-    remote_version="$(curl --proto '=https' --tlsv1.2 -fsSL "${MANAGER_RAW_BASE}/mb-singbox.sh?ts=$(date +%s)" 2>/dev/null | awk -F '"' '/^VERSION="[0-9]/{print $2; exit}')"
+    stamp="$(date +%s)"
+    api_url="https://api.github.com/repos/${MANAGER_REPO}/contents/mb-singbox.sh"
+    remote_version="$(curl --proto '=https' --tlsv1.2 -fsSL \
+      -H 'Accept: application/vnd.github.raw+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      -H 'Cache-Control: no-cache' \
+      --get --data-urlencode "ref=${MANAGER_REF}" --data-urlencode "ts=${stamp}" \
+      "$api_url" 2>/dev/null | awk -F '"' '/^VERSION="[0-9]/{print $2; exit}' || true)"
+    if [[ -n "$remote_version" ]]; then
+      remote_source="GitHub API"
+    else
+      remote_version="$(curl --proto '=https' --tlsv1.2 -fsSL \
+        -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+        "${MANAGER_RAW_BASE}/mb-singbox.sh?ts=${stamp}" 2>/dev/null | \
+        awk -F '"' '/^VERSION="[0-9]/{print $2; exit}' || true)"
+      [[ -z "$remote_version" ]] || remote_source="GitHub Raw"
+    fi
     remote_version="${remote_version:-无法获取}"
   fi
 
@@ -3267,7 +3311,7 @@ doctor() {
   printf '主命令目标：%s -> %s\n' "$QUICK_PATH" "$quick_target"
   printf '兼容命令目标：%s -> %s\n' "$LEGACY_QUICK_PATH" "$legacy_target"
   printf '安装文件 SHA-256：%s\n' "$installed_hash"
-  printf '远端 %s@%s：%s\n' "$MANAGER_REPO" "$MANAGER_REF" "$remote_version"
+  printf '远端 %s@%s：%s（%s）\n' "$MANAGER_REPO" "$MANAGER_REF" "$remote_version" "$remote_source"
   printf 'sing-box 内核：%s\n' "$(current_core_version 2>/dev/null || printf '未安装')"
   if [[ -s "$STATE_FILE" ]] && state_valid "$STATE_FILE"; then
     printf '状态文件：有效（%s）\n' "$STATE_FILE"
