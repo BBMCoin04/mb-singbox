@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.5.3"
+VERSION="0.5.4"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/mb-singbox}"
@@ -876,7 +876,7 @@ render_client_config() {
       http_clients: [
         {
           tag: "rule-set-download",
-          domain_resolver: {server: "dns-bootstrap", strategy: "ipv4_only"}
+          domain_resolver: {server: "dns-bootstrap", strategy: "prefer_ipv4"}
         }
       ],
       log: {level: "info", timestamp: true},
@@ -888,38 +888,34 @@ render_client_config() {
           {
             type: "https", tag: "dns-direct", server: "dns.alidns.com",
             path: "/dns-query",
-            domain_resolver: {server: "dns-bootstrap", strategy: "ipv4_only"}
+            domain_resolver: {server: "dns-bootstrap", strategy: "prefer_ipv4"}
           },
           {
             type: "https", tag: "dns-remote", server: "dns.google",
             path: "/dns-query", detour: "manual",
-            domain_resolver: {server: "dns-direct", strategy: "ipv4_only"}
+            domain_resolver: {server: "dns-direct", strategy: "prefer_ipv4"}
           },
           {
             type: "fakeip", tag: "dns-fakeip",
-            inet4_range: "198.18.0.0/15"
+            inet4_range: "198.18.0.0/15", inet6_range: "fc00::/18"
           }
         ],
         rules: [
           {
-            query_type: "AAAA", action: "predefined",
-            rcode: "NOERROR", answer: [], ns: [], extra: []
-          },
-          {
             domain_suffix: [".lan", ".local", ".localhost", ".localdomain"],
             action: "route", server: "dns-direct"
           },
-          {rule_set: "geosite-cn", action: "route", server: "dns-direct"},
-          {query_type: "A", action: "route", server: "dns-fakeip"}
+          {rule_set: "geosite-geolocation-cn", action: "route", server: "dns-direct"},
+          {query_type: ["A", "AAAA"], action: "route", server: "dns-fakeip"}
         ],
         final: "dns-remote",
-        strategy: "ipv4_only",
+        strategy: "prefer_ipv4",
         reverse_mapping: true
       },
       inbounds: [
         {
           type: "tun", tag: "tun-in",
-          address: ["172.19.0.1/30"],
+          address: ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
           auto_route: true, strict_route: true,
           stack: "mixed", dns_mode: "hijack"
         }
@@ -950,13 +946,25 @@ render_client_config() {
             domain_suffix: [".lan", ".local", ".localhost", ".localdomain"],
             action: "route", outbound: "direct"
           },
-          {rule_set: "geosite-cn", action: "route", outbound: "direct"},
-          {rule_set: "geoip-cn", action: "route", outbound: "direct"}
+          {rule_set: "geosite-geolocation-cn", action: "route", outbound: "direct"},
+          {
+            type: "logical", mode: "and",
+            rules: [
+              {rule_set: "geoip-cn"},
+              {rule_set: "geosite-geolocation-!cn", invert: true}
+            ],
+            action: "route", outbound: "direct"
+          }
         ],
         rule_set: [
           {
-            type: "remote", tag: "geosite-cn", format: "binary",
-            url: "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs",
+            type: "remote", tag: "geosite-geolocation-cn", format: "binary",
+            url: "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-geolocation-cn.srs",
+            update_interval: "1d"
+          },
+          {
+            type: "remote", tag: "geosite-geolocation-!cn", format: "binary",
+            url: "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-geolocation-!cn.srs",
             update_interval: "1d"
           },
           {
@@ -967,7 +975,7 @@ render_client_config() {
         ],
         final: "manual",
         auto_detect_interface: true,
-        default_domain_resolver: {server: "dns-direct", strategy: "ipv4_only"},
+        default_domain_resolver: {server: "dns-direct", strategy: "prefer_ipv4"},
         default_http_client: "rule-set-download"
       },
       experimental: {

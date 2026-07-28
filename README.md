@@ -1,6 +1,6 @@
 # MB sing-box 管理器
 
-MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.5.3`。
+MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.5.4`。
 
 命名约定：`MB` 只作为项目系列前缀，不另行展开；用户界面统一使用“MB sing-box 管理器”，技术标识统一使用 `mb-singbox`，上游内核统一写作 `sing-box`。主命令是 `mb-singbox`；旧命令 `singbox` 仅作为兼容别名保留。
 
@@ -132,9 +132,9 @@ journalctl -u mb-singbox -n 50 --no-pager
 /etc/mb-singbox/qrcodes/
 ```
 
-- Desktop TUN：供官方 sing-box for Desktop `1.14.0+` 使用，通过 IPv4 TUN 接管 TCP、UDP 和 DNS 流量
+- Desktop TUN：供官方 sing-box for Desktop `1.14.0+` 使用，通过双栈 TUN 接管 IPv4、IPv6、TCP、UDP 和 DNS 流量
 - Desktop 出站组：`auto` 自动测试全部节点；`manual` 默认使用 `auto`，也可手动固定任一节点
-- Desktop DNS：使用独立 IPv4 bootstrap、国内 DoH、代理 DoH 和 IPv4 FakeIP；AAAA 查询返回空结果
+- Desktop DNS：使用独立 bootstrap、国内 DoH、代理 DoH 和双栈 FakeIP；域名解析优先 IPv4，IPv4 不可用时允许回退 IPv6
 - 规则集：通过独立直连 HTTP client 下载 SagerNet 官方 geosite/geoip 二进制规则的 CDN 镜像，不依赖代理组启动
 - 分享输出：继续生成 `all.txt`、每个节点的单独链接和二维码
 
@@ -155,11 +155,13 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 
 ## 更新与备份
 
-从 `0.3.x`、`0.4.2`、`0.4.3`、`0.5.0`、`0.5.1` 或 `0.5.2` 更新到 `0.5.3` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
+从 `0.3.x`、`0.4.2`、`0.4.3`、`0.5.0`、`0.5.1`、`0.5.2` 或 `0.5.3` 更新到 `0.5.4` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
 
 `0.5.2` 起，重新生成配置时会先备份现有客户端、链接和二维码目录，只生成 `sing-box-desktop.json`。旧的 `sing-box-router.json` 会随客户端目录替换而移除；`all.txt`、每个节点的单独链接和二维码继续生成。
 
 `0.5.3` 起，管理器更新优先通过 GitHub Contents API 获取分支实时文件，`raw.githubusercontent.com` 仅作为回退。远端版本与当前版本相同时只提示已是最新版，不再重复覆盖。
+
+`0.5.4` 起，Desktop 配置使用双栈 TUN 和双栈 FakeIP，DNS 与节点域名解析采用 IPv4 优先、IPv6 回退。国内域名按 `geosite-geolocation-cn` 直连；CN IP 仅在不属于明确非 CN 域名时直连，以减少 CDN 误分流。
 
 脚本修改配置前会执行校验并创建备份，默认保留最近 20 份：
 
