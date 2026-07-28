@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.5.0"
+VERSION="0.5.1"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/mb-singbox}"
@@ -496,6 +496,12 @@ current_core_version() {
   "$SINGBOX_BIN" version 2>/dev/null | awk '/sing-box version/ {print $3; exit}'
 }
 
+version_at_least() {
+  local current="$1" minimum="$2"
+  [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$minimum" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [[ "$(printf '%s\n' "$minimum" "$current" | sort -V | head -n 1)" == "$minimum" ]]
+}
+
 download_core() {
   local version="${1:-}" arch archive_url release_json temp_dir archive expected actual extracted
   [[ -n "$version" ]] || version="$(latest_stable_version)" || {
@@ -863,10 +869,14 @@ make_outbound_json() {
 
 render_client_config() {
   local outbounds_file="$1" mode="$2" output="$3"
+  [[ "$mode" == "desktop" || "$mode" == "router" ]] || return 1
   jq -n --slurpfile proxies "$outbounds_file" --arg mode "$mode" '
     ($proxies[0]) as $p |
     ($p | map(.tag)) as $tags |
     {
+      http_clients: [
+        {tag: "rule-set-download", detour: "proxy"}
+      ],
       log: {level: "info", timestamp: true},
       dns: {
         servers: [
@@ -889,14 +899,11 @@ render_client_config() {
         final: "dns-remote",
         strategy: "prefer_ipv4"
       },
-      inbounds: (if $mode == "tun" then [
+      inbounds: (if $mode == "desktop" then [
         {
-          type: "tun", tag: "tun-in", address: ["172.19.0.1/30"],
-          auto_route: true, strict_route: true, stack: "mixed"
-        },
-        {
-          type: "mixed", tag: "mixed-in", listen: "127.0.0.1",
-          listen_port: 2080, set_system_proxy: false
+          type: "tun", tag: "tun-in",
+          address: ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+          auto_route: true, strict_route: true, stack: "mixed", dns_mode: "hijack"
         }
       ] elif $mode == "router" then [
         {
@@ -910,12 +917,7 @@ render_client_config() {
             "224.0.0.0/3", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"
           ]
         }
-      ] else [
-        {
-          type: "mixed", tag: "mixed-in", listen: "127.0.0.1",
-          listen_port: 2080, set_system_proxy: true
-        }
-      ] end),
+      ] else error("unknown client mode") end),
       outbounds: ($p + [
         {
           type: "selector", tag: "proxy", outbounds: $tags,
@@ -937,17 +939,18 @@ render_client_config() {
           {
             type: "remote", tag: "geosite-cn", format: "binary",
             url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
-            download_detour: "proxy", update_interval: "1d"
+            update_interval: "1d"
           },
           {
             type: "remote", tag: "geoip-cn", format: "binary",
             url: "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
-            download_detour: "proxy", update_interval: "1d"
+            update_interval: "1d"
           }
         ],
         final: "proxy",
         auto_detect_interface: true,
-        default_domain_resolver: "dns-direct"
+        default_domain_resolver: "dns-direct",
+        default_http_client: "rule-set-download"
       },
       experimental: {
         cache_file: {
@@ -1189,8 +1192,10 @@ swap_generated_outputs() {
 generate_outputs() {
   local state="$1" temp_root server client_server node_json id name link link_file argo_hostname="" outbound
   local preferred_key="" argo_preferred_address="" argo_path="" argo_port=2096
+  local core_version
   ensure_directories || return 1
   state_valid "$state" || { error "拒绝从无效状态生成客户端配置。"; return 1; }
+  core_version="$(current_core_version)" || { error "无法读取 sing-box 内核版本。"; return 1; }
   temp_root="$(mktemp -d "${ROOT_DIR}/.outputs.XXXXXX")" || return 1
   if ! install -d -m 0700 "$temp_root/clients" "$temp_root/links" "$temp_root/qrcodes"; then
     rm -rf -- "$temp_root"
@@ -1266,18 +1271,27 @@ generate_outputs() {
   fi
 
   if [[ "$(jq 'length' "$temp_root/all-outbounds.json")" -gt 0 ]]; then
-    render_client_config "$temp_root/all-outbounds.json" tun "$temp_root/clients/sing-box-windows-tun.json" || { rm -rf "$temp_root"; return 1; }
-    render_client_config "$temp_root/all-outbounds.json" system-proxy "$temp_root/clients/sing-box-windows-system-proxy.json" || { rm -rf "$temp_root"; return 1; }
-    render_client_config "$temp_root/all-outbounds.json" router "$temp_root/clients/sing-box-router-tun.json" || { rm -rf "$temp_root"; return 1; }
+    render_client_config "$temp_root/all-outbounds.json" desktop "$temp_root/clients/sing-box-desktop.json" || { rm -rf "$temp_root"; return 1; }
+    render_client_config "$temp_root/all-outbounds.json" router "$temp_root/clients/sing-box-router.json" || { rm -rf "$temp_root"; return 1; }
   fi
   rm -f "$temp_root/all-outbounds.json"
 
-  local client_config
+  local client_config client_name client_min_version
   while IFS= read -r client_config; do
-    if ! "$SINGBOX_BIN" check -c "$client_config" >/dev/null; then
-      error "客户端候选配置未通过 sing-box 检查：$(basename "$client_config")"
+    client_name="$(basename "$client_config")"
+    client_min_version="1.14.0"
+    if version_at_least "$core_version" "$client_min_version"; then
+      if ! "$SINGBOX_BIN" check -c "$client_config" >/dev/null; then
+        error "客户端候选配置未通过 sing-box 检查：${client_name}"
+        rm -rf "$temp_root"
+        return 1
+      fi
+    elif ! jq -e 'type == "object"' "$client_config" >/dev/null; then
+      error "客户端候选配置不是有效的 JSON 对象：${client_name}"
       rm -rf "$temp_root"
       return 1
+    else
+      warn "${client_name} 要求 sing-box ${client_min_version} 或更高版本；当前内核 ${core_version} 仅完成 JSON 语法检查。"
     fi
   done < <(find "$temp_root/clients" -type f -name '*.json' -print)
 
@@ -1777,9 +1791,8 @@ show_node_result() {
   argo_preferred_link_file="${LINK_DIR}/${id}-argo-preferred.txt"
   printf '\n%s节点详情%s\n' "$C_BOLD" "$C_RESET"
   printf '名称：%s\n协议：%s\n端口：%s\n' "$name" "$type" "$port"
-  printf 'Windows TUN 总配置：%s/sing-box-windows-tun.json\n' "$CLIENT_DIR"
-  printf 'Windows 系统代理总配置：%s/sing-box-windows-system-proxy.json\n' "$CLIENT_DIR"
-  printf 'Linux/OpenWrt 软路由总配置：%s/sing-box-router-tun.json\n' "$CLIENT_DIR"
+  printf '官方 Desktop TUN 总配置：%s/sing-box-desktop.json\n' "$CLIENT_DIR"
+  printf 'Linux/OpenWrt 软路由总配置：%s/sing-box-router.json\n' "$CLIENT_DIR"
   if [[ -s "$link_file" ]]; then
     printf '\n直连分享链接：\n'
     cat "$link_file"
@@ -1815,7 +1828,7 @@ list_nodes() {
   fi
   jq -r '.nodes | to_entries[] | [(.key+1|tostring), .value.name, .value.type, (.value.port|tostring), (if (.value.type=="hysteria2" or .value.type=="tuic") then "UDP" else "TCP" end), .value.id] | @tsv' "$STATE_FILE" | \
     awk -F '\t' '{printf "%2s. %-18s  %-10s  %5s/%-3s  ID=%s\n", $1, $2, $3, $4, $5, $6}'
-  printf '\n客户端总配置：\n  %s/sing-box-windows-tun.json\n  %s/sing-box-windows-system-proxy.json\n  %s/sing-box-router-tun.json\n' "$CLIENT_DIR" "$CLIENT_DIR" "$CLIENT_DIR"
+  printf '\n客户端总配置：\n  Desktop TUN：%s/sing-box-desktop.json\n  软路由 TUN：%s/sing-box-router.json\n' "$CLIENT_DIR" "$CLIENT_DIR"
   printf '全部分享链接：%s/all.txt\n' "$LINK_DIR"
   if jq -e '.argo.enabled' "$STATE_FILE" >/dev/null; then
     printf 'Argo：%s，%s，%s\n' \

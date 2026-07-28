@@ -1,6 +1,6 @@
 # MB sing-box 管理器
 
-MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.5.0`。
+MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.5.1`。
 
 命名约定：`MB` 只作为项目系列前缀，不另行展开；用户界面统一使用“MB sing-box 管理器”，技术标识统一使用 `mb-singbox`，上游内核统一写作 `sing-box`。主命令是 `mb-singbox`；旧命令 `singbox` 仅作为兼容别名保留。
 
@@ -17,7 +17,8 @@ MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理
 
 - Debian、Ubuntu、CentOS、Rocky Linux、AlmaLinux 等使用 systemd 的 Linux VPS
 - root 权限
-- sing-box `1.13.0` 或更高版本
+- VPS 服务端支持 sing-box `1.13.0` 或更高版本
+- Desktop 和 Router 客户端配置要求 sing-box `1.14.0` 或更高版本
 - 创建 Hysteria2、TUIC、AnyTLS、VMess 前，需要准备受系统信任的 TLS 证书
 - 证书建议放在 `/etc/acme/certs/<域名>/`，不要放在 `/root` 或 `/home`
 
@@ -126,18 +127,16 @@ journalctl -u mb-singbox -n 50 --no-pager
 ## 客户端文件
 
 ```text
-/etc/mb-singbox/clients/sing-box-windows-tun.json
-/etc/mb-singbox/clients/sing-box-windows-system-proxy.json
-/etc/mb-singbox/clients/sing-box-router-tun.json
+/etc/mb-singbox/clients/sing-box-desktop.json
+/etc/mb-singbox/clients/sing-box-router.json
 /etc/mb-singbox/links/all.txt
 /etc/mb-singbox/qrcodes/
 ```
 
-- Windows TUN：全局接管流量
-- Windows 系统代理：只代理使用系统代理的软件
-- Router TUN：适合直接运行原生 sing-box 的 Linux/OpenWrt
+- Desktop TUN：供官方 sing-box for Desktop `1.14.0+` 使用，通过 TUN 接管 TCP、UDP 和 DNS 流量
+- Router TUN：供运行 sing-box `1.14.0+` 的 Linux/OpenWrt 软路由使用
 
-不同 Windows 配置不要同时运行，否则本地端口可能冲突。
+Desktop 配置不启用 Windows 系统代理，也不额外开放本地 mixed 入站。两份客户端配置统一使用 `http_clients` 和 `route.default_http_client` 下载远程规则集，不向下兼容 sing-box `1.13.x`。
 
 ## Argo
 
@@ -154,7 +153,9 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 
 ## 更新与备份
 
-从 `0.3.x`、`0.4.2` 或 `0.4.3` 更新到 `0.5.0` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
+从 `0.3.x`、`0.4.2`、`0.4.3` 或 `0.5.0` 更新到 `0.5.1` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
+
+`0.5.1` 重新生成配置时会先备份现有客户端目录，再用 `sing-box-desktop.json` 和 `sing-box-router.json` 替换旧的三份客户端 JSON。
 
 脚本修改配置前会执行校验并创建备份，默认保留最近 20 份：
 
