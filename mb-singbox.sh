@@ -6,8 +6,9 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.5.4"
+VERSION="0.5.5"
 PROGRAM="mb-singbox"
+MANAGER_UPDATE_APPLIED=0
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/mb-singbox}"
 LEGACY_QUICK_PATH="${MB_SINGBOX_LEGACY_QUICK_PATH:-/usr/local/bin/singbox}"
@@ -3127,6 +3128,7 @@ install_manager_binary() {
 
 update_manager() {
   local stamp api_url raw_url candidate backup new_version download_source=""
+  MANAGER_UPDATE_APPLIED=0
   require_root
   command -v curl >/dev/null 2>&1 || install_dependencies || return 1
   stamp="$(date +%s)"
@@ -3202,6 +3204,7 @@ update_manager() {
   fi
   rm -f -- "$backup"
   install_quick_command || warn "管理器已更新，但主命令或兼容命令检查失败。"
+  MANAGER_UPDATE_APPLIED=1
   ok "MB sing-box 管理器已更新：${VERSION} -> ${new_version}"
 }
 
@@ -3223,10 +3226,16 @@ maintenance_menu() {
         ;;
       3)
         if update_manager; then
-          info "正在重新载入最新版菜单..."
-          exec "$INSTALL_PATH" </dev/tty >/dev/tty 2>/dev/tty
+          if (( MANAGER_UPDATE_APPLIED )); then
+            info "按 Enter 键重新载入最新版菜单。"
+            pause
+            exec "$INSTALL_PATH" </dev/tty >/dev/tty 2>/dev/tty
+          else
+            pause
+          fi
+        else
+          pause
         fi
-        pause
         ;;
       4)
         regenerate_all_configs
