@@ -873,9 +873,10 @@ render_client_config() {
   jq -n --slurpfile proxies "$outbounds_file" --arg mode "$mode" '
     ($proxies[0]) as $p |
     ($p | map(.tag)) as $tags |
+    (if $mode == "desktop" then "manual" else "proxy" end) as $proxy_tag |
     {
       http_clients: [
-        {tag: "rule-set-download", detour: "proxy"}
+        {tag: "rule-set-download", detour: $proxy_tag}
       ],
       log: {level: "info", timestamp: true},
       dns: {
@@ -887,7 +888,7 @@ render_client_config() {
           {
             type: "https", tag: "dns-remote", server: "1.1.1.1", server_port: 443,
             path: "/dns-query", tls: {enabled: true, server_name: "cloudflare-dns.com"},
-            detour: "proxy"
+            detour: $proxy_tag
           }
         ],
         rules: [
@@ -918,11 +919,23 @@ render_client_config() {
           ]
         }
       ] else error("unknown client mode") end),
-      outbounds: ($p + [
+      outbounds: ($p + (if $mode == "desktop" then [
+        {
+          type: "urltest", tag: "auto", outbounds: $tags,
+          url: "https://www.gstatic.com/generate_204",
+          interval: "3m", tolerance: 50, idle_timeout: "30m",
+          interrupt_exist_connections: false
+        },
+        {
+          type: "selector", tag: "manual", outbounds: (["auto"] + $tags),
+          default: "auto", interrupt_exist_connections: false
+        }
+      ] else [
         {
           type: "selector", tag: "proxy", outbounds: $tags,
           default: $tags[0], interrupt_exist_connections: false
-        },
+        }
+      ] end) + [
         {type: "direct", tag: "direct"}
       ]),
       route: {
@@ -930,7 +943,7 @@ render_client_config() {
           {action: "sniff"},
           {protocol: "dns", action: "hijack-dns"},
           {clash_mode: "direct", action: "route", outbound: "direct"},
-          {clash_mode: "global", action: "route", outbound: "proxy"},
+          {clash_mode: "global", action: "route", outbound: $proxy_tag},
           {ip_is_private: true, action: "route", outbound: "direct"},
           {domain_suffix: [".lan", ".local", ".localhost", ".localdomain"], action: "route", outbound: "direct"},
           {rule_set: ["geosite-cn", "geoip-cn"], action: "route", outbound: "direct"}
@@ -947,7 +960,7 @@ render_client_config() {
             update_interval: "1d"
           }
         ],
-        final: "proxy",
+        final: $proxy_tag,
         auto_detect_interface: true,
         default_domain_resolver: "dns-direct",
         default_http_client: "rule-set-download"

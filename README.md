@@ -134,6 +134,7 @@ journalctl -u mb-singbox -n 50 --no-pager
 ```
 
 - Desktop TUN：供官方 sing-box for Desktop `1.14.0+` 使用，通过 TUN 接管 TCP、UDP 和 DNS 流量
+- Desktop 出站组：`auto` 自动测试全部节点；`manual` 默认使用 `auto`，也可手动固定任一节点
 - Router TUN：供运行 sing-box `1.14.0+` 的 Linux/OpenWrt 软路由使用
 
 Desktop 配置不启用 Windows 系统代理，也不额外开放本地 mixed 入站。两份客户端配置统一使用 `http_clients` 和 `route.default_http_client` 下载远程规则集，不向下兼容 sing-box `1.13.x`。
