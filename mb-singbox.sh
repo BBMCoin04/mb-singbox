@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.6.0"
+VERSION="0.6.1"
 PROGRAM="mb-singbox"
 MANAGER_UPDATE_APPLIED=0
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
@@ -620,6 +620,7 @@ ensure_nft_available() {
 
 render_port_hopping_nft() {
   local state="$1" output="$2" table_name="${3:-$PORT_HOPPING_NFT_TABLE}"
+  local id start end target
   {
     printf 'table inet %s {\n' "$table_name"
     printf '  chain prerouting {\n'
@@ -1505,7 +1506,7 @@ generate_outputs() {
       rm -rf "$temp_root"
       return 1
     else
-      warn "${client_name} 要求 sing-box ${client_min_version} 或更高版本；当前内核 ${core_version} 仅完成 JSON 语法检查。"
+      warn "${client_name} 使用 sing-box ${client_min_version}+ 的 Desktop 功能；当前服务端内核 ${core_version} 仅完成 JSON 语法检查，不影响 V2rayN 分享链接。"
     fi
   done < <(find "$temp_root/clients" -type f -name '*.json' -print)
 
@@ -2250,6 +2251,8 @@ set_hysteria2_port_hopping() {
   confirm "确认启用此端口跳跃范围？" || return 0
   if apply_node_field_update "$id" '.port_hopping={enabled:true,start:$start,end:$end,hop_interval:30}' \
       --argjson start "$start" --argjson end "$end"; then
+    start="$(jq -r --arg id "$id" '.nodes[] | select(.id==$id) | .port_hopping.start' "$STATE_FILE")"
+    end="$(jq -r --arg id "$id" '.nodes[] | select(.id==$id) | .port_hopping.end' "$STATE_FILE")"
     ok "Hysteria2 端口跳跃已启用：UDP ${start}-${end}，间隔 30 秒。"
     port_hopping_client_notice
   else
