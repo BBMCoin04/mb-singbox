@@ -1,6 +1,6 @@
 # MB sing-box 管理器
 
-MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.5.1`。
+MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.5.2`。
 
 命名约定：`MB` 只作为项目系列前缀，不另行展开；用户界面统一使用“MB sing-box 管理器”，技术标识统一使用 `mb-singbox`，上游内核统一写作 `sing-box`。主命令是 `mb-singbox`；旧命令 `singbox` 仅作为兼容别名保留。
 
@@ -18,7 +18,7 @@ MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理
 - Debian、Ubuntu、CentOS、Rocky Linux、AlmaLinux 等使用 systemd 的 Linux VPS
 - root 权限
 - VPS 服务端支持 sing-box `1.13.0` 或更高版本
-- Desktop 和 Router 客户端配置要求 sing-box `1.14.0` 或更高版本
+- Desktop 客户端配置要求 sing-box `1.14.0` 或更高版本
 - 创建 Hysteria2、TUIC、AnyTLS、VMess 前，需要准备受系统信任的 TLS 证书
 - 证书建议放在 `/etc/acme/certs/<域名>/`，不要放在 `/root` 或 `/home`
 
@@ -128,16 +128,17 @@ journalctl -u mb-singbox -n 50 --no-pager
 
 ```text
 /etc/mb-singbox/clients/sing-box-desktop.json
-/etc/mb-singbox/clients/sing-box-router.json
 /etc/mb-singbox/links/all.txt
 /etc/mb-singbox/qrcodes/
 ```
 
-- Desktop TUN：供官方 sing-box for Desktop `1.14.0+` 使用，通过 TUN 接管 TCP、UDP 和 DNS 流量
+- Desktop TUN：供官方 sing-box for Desktop `1.14.0+` 使用，通过 IPv4 TUN 接管 TCP、UDP 和 DNS 流量
 - Desktop 出站组：`auto` 自动测试全部节点；`manual` 默认使用 `auto`，也可手动固定任一节点
-- Router TUN：供运行 sing-box `1.14.0+` 的 Linux/OpenWrt 软路由使用
+- Desktop DNS：使用独立 IPv4 bootstrap、国内 DoH、代理 DoH 和 IPv4 FakeIP；AAAA 查询返回空结果
+- 规则集：通过独立直连 HTTP client 下载 SagerNet 官方 geosite/geoip 二进制规则的 CDN 镜像，不依赖代理组启动
+- 分享输出：继续生成 `all.txt`、每个节点的单独链接和二维码
 
-Desktop 配置不启用 Windows 系统代理，也不额外开放本地 mixed 入站。两份客户端配置统一使用 `http_clients` 和 `route.default_http_client` 下载远程规则集，不向下兼容 sing-box `1.13.x`。
+Desktop 配置不启用 Windows 系统代理，也不额外开放本地 mixed 入站。项目不再生成软路由 JSON，不向下兼容 sing-box `1.13.x`。
 
 ## Argo
 
@@ -154,9 +155,9 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 
 ## 更新与备份
 
-从 `0.3.x`、`0.4.2`、`0.4.3` 或 `0.5.0` 更新到 `0.5.1` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
+从 `0.3.x`、`0.4.2`、`0.4.3`、`0.5.0` 或 `0.5.1` 更新到 `0.5.2` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
 
-`0.5.1` 重新生成配置时会先备份现有客户端目录，再用 `sing-box-desktop.json` 和 `sing-box-router.json` 替换旧的三份客户端 JSON。
+`0.5.2` 重新生成配置时会先备份现有客户端、链接和二维码目录，只生成 `sing-box-desktop.json`。旧的 `sing-box-router.json` 会随客户端目录替换而移除；`all.txt`、每个节点的单独链接和二维码继续生成。
 
 脚本修改配置前会执行校验并创建备份，默认保留最近 20 份：
 
@@ -200,7 +201,7 @@ journalctl -u mb-singbox -n 50 --no-pager
 
 ### Hysteria2/TUIC 延迟显示 `-1`
 
-UDP、QUIC、TUN 或软路由环境可能导致延迟测试不准确。请同时检查实际网页访问和服务端日志，并确认云安全组已放行对应 UDP 端口。
+UDP、QUIC 或 TUN 环境可能导致延迟测试不准确。请同时检查实际网页访问和服务端日志，并确认云安全组已放行对应 UDP 端口。
 
 ## 卸载
 

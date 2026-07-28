@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.5.1"
+VERSION="0.5.2"
 PROGRAM="mb-singbox"
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
 QUICK_PATH="${MB_SINGBOX_QUICK_PATH:-/usr/local/bin/mb-singbox}"
@@ -868,58 +868,63 @@ make_outbound_json() {
 }
 
 render_client_config() {
-  local outbounds_file="$1" mode="$2" output="$3"
-  [[ "$mode" == "desktop" || "$mode" == "router" ]] || return 1
-  jq -n --slurpfile proxies "$outbounds_file" --arg mode "$mode" '
+  local outbounds_file="$1" output="$2"
+  jq -n --slurpfile proxies "$outbounds_file" '
     ($proxies[0]) as $p |
     ($p | map(.tag)) as $tags |
-    (if $mode == "desktop" then "manual" else "proxy" end) as $proxy_tag |
     {
       http_clients: [
-        {tag: "rule-set-download", detour: $proxy_tag}
+        {
+          tag: "rule-set-download",
+          domain_resolver: {server: "dns-bootstrap", strategy: "ipv4_only"}
+        }
       ],
       log: {level: "info", timestamp: true},
       dns: {
         servers: [
           {
-            type: "https", tag: "dns-direct", server: "223.5.5.5", server_port: 443,
-            path: "/dns-query", tls: {enabled: true, server_name: "dns.alidns.com"}
+            type: "udp", tag: "dns-bootstrap", server: "223.5.5.5"
           },
           {
-            type: "https", tag: "dns-remote", server: "1.1.1.1", server_port: 443,
-            path: "/dns-query", tls: {enabled: true, server_name: "cloudflare-dns.com"},
-            detour: $proxy_tag
+            type: "https", tag: "dns-direct", server: "dns.alidns.com",
+            path: "/dns-query",
+            domain_resolver: {server: "dns-bootstrap", strategy: "ipv4_only"}
+          },
+          {
+            type: "https", tag: "dns-remote", server: "dns.google",
+            path: "/dns-query", detour: "manual",
+            domain_resolver: {server: "dns-direct", strategy: "ipv4_only"}
+          },
+          {
+            type: "fakeip", tag: "dns-fakeip",
+            inet4_range: "198.18.0.0/15"
           }
         ],
         rules: [
-          {clash_mode: "direct", action: "route", server: "dns-direct"},
-          {clash_mode: "global", action: "route", server: "dns-remote"},
-          {domain_suffix: [".lan", ".local", ".localhost", ".localdomain"], action: "route", server: "dns-direct"},
-          {rule_set: "geosite-cn", action: "route", server: "dns-direct"}
+          {
+            query_type: "AAAA", action: "predefined",
+            rcode: "NOERROR", answer: [], ns: [], extra: []
+          },
+          {
+            domain_suffix: [".lan", ".local", ".localhost", ".localdomain"],
+            action: "route", server: "dns-direct"
+          },
+          {rule_set: "geosite-cn", action: "route", server: "dns-direct"},
+          {query_type: "A", action: "route", server: "dns-fakeip"}
         ],
         final: "dns-remote",
-        strategy: "prefer_ipv4"
+        strategy: "ipv4_only",
+        reverse_mapping: true
       },
-      inbounds: (if $mode == "desktop" then [
+      inbounds: [
         {
           type: "tun", tag: "tun-in",
-          address: ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
-          auto_route: true, strict_route: true, stack: "mixed", dns_mode: "hijack"
+          address: ["172.19.0.1/30"],
+          auto_route: true, strict_route: true,
+          stack: "mixed", dns_mode: "hijack"
         }
-      ] elif $mode == "router" then [
-        {
-          type: "tun", tag: "tun-in", interface_name: "singtun0",
-          address: ["172.31.255.1/30", "fdfe:dcba:9876::1/126"],
-          auto_route: true, auto_redirect: true, strict_route: true,
-          stack: "system",
-          route_exclude_address: [
-            "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
-            "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
-            "224.0.0.0/3", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"
-          ]
-        }
-      ] else error("unknown client mode") end),
-      outbounds: ($p + (if $mode == "desktop" then [
+      ],
+      outbounds: ($p + [
         {
           type: "urltest", tag: "auto", outbounds: $tags,
           url: "https://www.gstatic.com/generate_204",
@@ -929,48 +934,47 @@ render_client_config() {
         {
           type: "selector", tag: "manual", outbounds: (["auto"] + $tags),
           default: "auto", interrupt_exist_connections: false
-        }
-      ] else [
-        {
-          type: "selector", tag: "proxy", outbounds: $tags,
-          default: $tags[0], interrupt_exist_connections: false
-        }
-      ] end) + [
+        },
         {type: "direct", tag: "direct"}
       ]),
       route: {
         rules: [
-          {action: "sniff"},
-          {protocol: "dns", action: "hijack-dns"},
-          {clash_mode: "direct", action: "route", outbound: "direct"},
-          {clash_mode: "global", action: "route", outbound: $proxy_tag},
+          {inbound: "tun-in", action: "sniff"},
+          {
+            type: "logical", mode: "or",
+            rules: [{port: 53}, {protocol: "dns"}],
+            action: "hijack-dns"
+          },
           {ip_is_private: true, action: "route", outbound: "direct"},
-          {domain_suffix: [".lan", ".local", ".localhost", ".localdomain"], action: "route", outbound: "direct"},
-          {rule_set: ["geosite-cn", "geoip-cn"], action: "route", outbound: "direct"}
+          {
+            domain_suffix: [".lan", ".local", ".localhost", ".localdomain"],
+            action: "route", outbound: "direct"
+          },
+          {rule_set: "geosite-cn", action: "route", outbound: "direct"},
+          {rule_set: "geoip-cn", action: "route", outbound: "direct"}
         ],
         rule_set: [
           {
             type: "remote", tag: "geosite-cn", format: "binary",
-            url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+            url: "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs",
             update_interval: "1d"
           },
           {
             type: "remote", tag: "geoip-cn", format: "binary",
-            url: "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+            url: "https://cdn.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs",
             update_interval: "1d"
           }
         ],
-        final: $proxy_tag,
+        final: "manual",
         auto_detect_interface: true,
-        default_domain_resolver: "dns-direct",
+        default_domain_resolver: {server: "dns-direct", strategy: "ipv4_only"},
         default_http_client: "rule-set-download"
       },
       experimental: {
         cache_file: {
-          enabled: true,
-          path: (if $mode == "router" then "/tmp/mb-singbox-cache.db" else "cache.db" end)
-        },
-        clash_api: {external_controller: "127.0.0.1:9090", default_mode: "rule"}
+          enabled: true, path: "cache.db",
+          store_fakeip: true, store_dns: true
+        }
       }
     }' > "$output"
 }
@@ -1284,8 +1288,7 @@ generate_outputs() {
   fi
 
   if [[ "$(jq 'length' "$temp_root/all-outbounds.json")" -gt 0 ]]; then
-    render_client_config "$temp_root/all-outbounds.json" desktop "$temp_root/clients/sing-box-desktop.json" || { rm -rf "$temp_root"; return 1; }
-    render_client_config "$temp_root/all-outbounds.json" router "$temp_root/clients/sing-box-router.json" || { rm -rf "$temp_root"; return 1; }
+    render_client_config "$temp_root/all-outbounds.json" "$temp_root/clients/sing-box-desktop.json" || { rm -rf "$temp_root"; return 1; }
   fi
   rm -f "$temp_root/all-outbounds.json"
 
@@ -1805,7 +1808,6 @@ show_node_result() {
   printf '\n%s节点详情%s\n' "$C_BOLD" "$C_RESET"
   printf '名称：%s\n协议：%s\n端口：%s\n' "$name" "$type" "$port"
   printf '官方 Desktop TUN 总配置：%s/sing-box-desktop.json\n' "$CLIENT_DIR"
-  printf 'Linux/OpenWrt 软路由总配置：%s/sing-box-router.json\n' "$CLIENT_DIR"
   if [[ -s "$link_file" ]]; then
     printf '\n直连分享链接：\n'
     cat "$link_file"
@@ -1841,7 +1843,7 @@ list_nodes() {
   fi
   jq -r '.nodes | to_entries[] | [(.key+1|tostring), .value.name, .value.type, (.value.port|tostring), (if (.value.type=="hysteria2" or .value.type=="tuic") then "UDP" else "TCP" end), .value.id] | @tsv' "$STATE_FILE" | \
     awk -F '\t' '{printf "%2s. %-18s  %-10s  %5s/%-3s  ID=%s\n", $1, $2, $3, $4, $5, $6}'
-  printf '\n客户端总配置：\n  Desktop TUN：%s/sing-box-desktop.json\n  软路由 TUN：%s/sing-box-router.json\n' "$CLIENT_DIR" "$CLIENT_DIR"
+  printf '\n客户端总配置：\n  Desktop TUN：%s/sing-box-desktop.json\n' "$CLIENT_DIR"
   printf '全部分享链接：%s/all.txt\n' "$LINK_DIR"
   if jq -e '.argo.enabled' "$STATE_FILE" >/dev/null; then
     printf 'Argo：%s，%s，%s\n' \
@@ -2025,7 +2027,7 @@ delete_node() {
   (( rc == 2 )) && return 0
   (( rc == 0 )) || return "$rc"
   jq -e --arg id "$id" '.argo.enabled and .argo.node_id == $id' "$STATE_FILE" >/dev/null && argo_bound=1
-  warn "将删除节点 ${id} 的服务端配置、桌面/软路由配置、链接和二维码。"
+  warn "将删除节点 ${id} 的服务端配置、桌面配置、链接和二维码。"
   (( argo_bound )) && warn "该节点绑定了 Argo，Argo 本地服务也会停止；不会删除 Cloudflare 远程 Tunnel。"
   confirm "确定删除？" || return 0
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
@@ -2994,7 +2996,7 @@ regenerate_all_configs() {
   if apply_candidate_state "$candidate"; then
     rm -f "$candidate"
     sync_firewall_if_managed
-    ok "服务端和全部桌面/软路由配置已重新生成、校验并应用。"
+    ok "服务端和桌面配置已重新生成、校验并应用。"
   else
     rm -f "$candidate"
     return 1
