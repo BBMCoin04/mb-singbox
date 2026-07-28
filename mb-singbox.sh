@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.5.5"
+VERSION="0.6.0"
 PROGRAM="mb-singbox"
 MANAGER_UPDATE_APPLIED=0
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
@@ -28,6 +28,11 @@ SINGBOX_BIN="${MB_SINGBOX_BIN:-${SINGBOX_HOME}/sing-box}"
 SERVICE_FILE="${MB_SINGBOX_SERVICE_FILE:-/etc/systemd/system/mb-singbox.service}"
 SERVICE_NAME="mb-singbox.service"
 MAIN_SERVICE_DESCRIPTION="MB sing-box proxy service"
+PORT_HOPPING_NFT_FILE="${MB_SINGBOX_PORT_HOPPING_NFT_FILE:-${ROOT_DIR}/port-hopping.nft}"
+PORT_HOPPING_SERVICE_FILE="${MB_SINGBOX_PORT_HOPPING_SERVICE_FILE:-/etc/systemd/system/mb-singbox-port-hopping.service}"
+PORT_HOPPING_SERVICE_NAME="mb-singbox-port-hopping.service"
+PORT_HOPPING_SERVICE_DESCRIPTION="MB sing-box Hysteria2 port hopping"
+PORT_HOPPING_NFT_TABLE="mb_singbox_port_hopping"
 DEFAULT_REALITY_TARGET="apple.com"
 CLOUDFLARED_BIN="${MB_SINGBOX_CLOUDFLARED_BIN:-${SINGBOX_HOME}/cloudflared}"
 ARGO_SERVICE_FILE="${MB_SINGBOX_ARGO_SERVICE_FILE:-/etc/systemd/system/mb-singbox-argo.service}"
@@ -131,6 +136,7 @@ validate_managed_layout() {
   path_is_within "$LINK_DIR" "$ROOT_DIR" || { error "链接目录必须位于 ${ROOT_DIR} 内。"; return 1; }
   path_is_within "$QR_DIR" "$ROOT_DIR" || { error "二维码目录必须位于 ${ROOT_DIR} 内。"; return 1; }
   path_is_within "$BACKUP_DIR" "$ROOT_DIR" || { error "备份目录必须位于 ${ROOT_DIR} 内。"; return 1; }
+  path_is_within "$PORT_HOPPING_NFT_FILE" "$ROOT_DIR" || { error "端口跳跃规则文件必须位于 ${ROOT_DIR} 内。"; return 1; }
   [[ "$(basename "$INSTALL_PATH")" == "mb-singbox" ]] || { error "管理器安装文件名必须是 mb-singbox。"; return 1; }
   [[ "$(basename "$QUICK_PATH")" == "mb-singbox" ]] || { error "主命令文件名必须是 mb-singbox。"; return 1; }
   [[ "$(basename "$LEGACY_QUICK_PATH")" == "singbox" ]] || { error "兼容命令文件名必须是 singbox。"; return 1; }
@@ -288,13 +294,21 @@ state_valid() {
       (.tls_domain | nonempty) and
       (.certificate_path | nonempty and startswith("/")) and
       (.key_path | nonempty and startswith("/"));
+    def valid_hopping:
+      (.port_hopping // {enabled:false,start:0,end:0,hop_interval:30}) as $hop |
+      ($hop | type == "object") and
+      ($hop.enabled | type == "boolean") and
+      ($hop.start | type == "number" and . == floor and . >= 0 and . <= 65535) and
+      ($hop.end | type == "number" and . == floor and . >= 0 and . <= 65535) and
+      ($hop.hop_interval | type == "number" and . == floor and . >= 5 and . <= 86400) and
+      (if $hop.enabled then $hop.start >= 1 and $hop.start < $hop.end else $hop.start == 0 and $hop.end == 0 end);
     def valid_node:
       common_node and
       if .type == "reality" then
         (.uuid | nonempty) and (.server_name | nonempty) and
         (.private_key | nonempty) and (.public_key | nonempty) and (.short_id | nonempty)
       elif .type == "hysteria2" then
-        tls_node and (.password | nonempty) and (.obfs_password | nonempty)
+        tls_node and (.password | nonempty) and (.obfs_password | nonempty) and valid_hopping
       elif .type == "tuic" then
         tls_node and (.uuid | nonempty) and (.password | nonempty)
       elif .type == "anytls" then
@@ -313,6 +327,21 @@ state_valid() {
     (([.nodes[].id] | length) == ([.nodes[].id] | unique | length)) and
     (([.nodes[] | ((if .type == "hysteria2" or .type == "tuic" then "udp:" else "tcp:" end) + (.port | tostring))] | length) ==
      ([.nodes[] | ((if .type == "hysteria2" or .type == "tuic" then "udp:" else "tcp:" end) + (.port | tostring))] | unique | length)) and
+    (all(.nodes[];
+      . as $node |
+      if $node.type == "hysteria2" and ($node.port_hopping.enabled // false) then
+        all($root.nodes[];
+          . as $other |
+          if $other.type == "hysteria2" or $other.type == "tuic" then
+            $other.port < $node.port_hopping.start or $other.port > $node.port_hopping.end
+          else true end) and
+        all($root.nodes[];
+          . as $other |
+          if $other.id != $node.id and $other.type == "hysteria2" and ($other.port_hopping.enabled // false) then
+            $other.port_hopping.end < $node.port_hopping.start or
+            $other.port_hopping.start > $node.port_hopping.end
+          else true end)
+      else true end)) and
     (.argo | type == "object") and
     (.argo.enabled | type == "boolean") and
     (.argo.mode | text) and (.argo.node_id | text) and (.argo.hostname | text) and
@@ -367,6 +396,7 @@ init_state() {
       .argo.verified //= false |
       .argo.tunnel_id //= "" |
       .argo.public_port //= 2096 |
+      .nodes |= map(if .type == "hysteria2" then .port_hopping //= {enabled:false,start:0,end:0,hop_interval:30} else . end) |
       .client //= {} |
       .client.preferred_enabled = (if (.client | has("preferred_enabled")) then .client.preferred_enabled else true end) |
       .client.preferred_addresses //= [
@@ -568,15 +598,165 @@ download_core() {
   printf '%s\n' "$extracted"
 }
 
-write_service_file() {
+port_hopping_enabled_in_state() {
+  jq -e 'any(.nodes[]; .type == "hysteria2" and (.port_hopping.enabled // false))' "$1" >/dev/null 2>&1
+}
+
+ensure_nft_available() {
+  command -v nft >/dev/null 2>&1 && return 0
+  info "端口跳跃需要 nftables，正在安装 nftables。"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y nftables
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y nftables
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y nftables
+  else
+    error "无法自动安装 nftables，请先安装 nft 命令。"
+    return 1
+  fi || return 1
+  command -v nft >/dev/null 2>&1 || { error "安装后仍找不到 nft 命令。"; return 1; }
+}
+
+render_port_hopping_nft() {
+  local state="$1" output="$2" table_name="${3:-$PORT_HOPPING_NFT_TABLE}"
+  {
+    printf 'table inet %s {\n' "$table_name"
+    printf '  chain prerouting {\n'
+    printf '    type nat hook prerouting priority dstnat; policy accept;\n'
+    while IFS=$'\t' read -r id start end target; do
+      printf '    udp dport %s-%s redirect to :%s comment "mb-singbox %s"\n' "$start" "$end" "$target" "$id"
+    done < <(jq -r '.nodes[] | select(.type == "hysteria2" and (.port_hopping.enabled // false)) | [.id,.port_hopping.start,.port_hopping.end,.port] | @tsv' "$state")
+    printf '  }\n'
+    printf '}\n'
+  } > "$output"
+}
+
+check_port_hopping_rules() {
+  local state="$1" temporary table_name
+  port_hopping_enabled_in_state "$state" || return 0
+  ensure_nft_available || return 1
+  temporary="$(mktemp /tmp/mb-singbox-port-hopping-check.XXXXXX.nft)" || return 1
+  table_name="${PORT_HOPPING_NFT_TABLE}_check_${BASHPID}_${RANDOM}"
+  if ! render_port_hopping_nft "$state" "$temporary" "$table_name" || ! nft -c -f "$temporary"; then
+    rm -f -- "$temporary"
+    error "Hysteria2 端口跳跃 nftables 规则校验失败。"
+    return 1
+  fi
+  rm -f -- "$temporary"
+}
+
+check_installed_port_hopping_rules() {
   local temporary
+  if ! port_hopping_enabled_in_state "$STATE_FILE"; then
+    return 0
+  fi
+  [[ -s "$PORT_HOPPING_NFT_FILE" ]] || { error "端口跳跃规则文件缺失：${PORT_HOPPING_NFT_FILE}"; return 1; }
+  temporary="$(mktemp /tmp/mb-singbox-port-hopping-current.XXXXXX.nft)" || return 1
+  render_port_hopping_nft "$STATE_FILE" "$temporary" || { rm -f -- "$temporary"; return 1; }
+  if ! cmp -s "$temporary" "$PORT_HOPPING_NFT_FILE"; then
+    rm -f -- "$temporary"
+    error "已安装的端口跳跃规则与当前状态不一致，请运行 mb-singbox render。"
+    return 1
+  fi
+  rm -f -- "$temporary"
+}
+
+clear_port_hopping_rules() {
+  command -v nft >/dev/null 2>&1 || return 0
+  if nft list table inet "$PORT_HOPPING_NFT_TABLE" >/dev/null 2>&1; then
+    nft delete table inet "$PORT_HOPPING_NFT_TABLE"
+  fi
+}
+
+apply_port_hopping_rules() {
+  command -v nft >/dev/null 2>&1 || { error "端口跳跃服务找不到 nft 命令。"; return 1; }
+  clear_port_hopping_rules || return 1
+  [[ -s "$PORT_HOPPING_NFT_FILE" ]] || return 0
+  if ! nft -f "$PORT_HOPPING_NFT_FILE"; then
+    clear_port_hopping_rules >/dev/null 2>&1 || true
+    return 1
+  fi
+}
+
+write_port_hopping_service_file() {
+  local temporary
+  temporary="$(mktemp /tmp/mb-singbox-port-hopping-service.XXXXXX)" || return 1
+  cat > "$temporary" <<EOF
+[Unit]
+Description=${PORT_HOPPING_SERVICE_DESCRIPTION}
+Wants=network-online.target
+After=network-online.target
+Before=${SERVICE_NAME}
+PartOf=${SERVICE_NAME}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${INSTALL_PATH} port-hopping-apply
+ExecReload=${INSTALL_PATH} port-hopping-apply
+ExecStop=${INSTALL_PATH} port-hopping-clear
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if ! atomic_install_file "$temporary" "$PORT_HOPPING_SERVICE_FILE" 0644; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  rm -f -- "$temporary"
+}
+
+sync_port_hopping_runtime() {
+  if port_hopping_enabled_in_state "$STATE_FILE"; then
+    ensure_nft_available || return 1
+    systemctl enable "$PORT_HOPPING_SERVICE_NAME" >/dev/null || return 1
+    systemctl restart "$PORT_HOPPING_SERVICE_NAME" || return 1
+    systemctl is-active --quiet "$PORT_HOPPING_SERVICE_NAME"
+  else
+    systemctl disable --now "$PORT_HOPPING_SERVICE_NAME" >/dev/null 2>&1 || true
+    clear_port_hopping_rules
+  fi
+}
+
+stop_port_hopping_service() {
+  systemctl disable --now "$PORT_HOPPING_SERVICE_NAME" >/dev/null 2>&1 || true
+  clear_port_hopping_rules >/dev/null 2>&1 || true
+}
+
+install_port_hopping_file_for_state() {
+  local state="$1" rendered="$2"
+  if port_hopping_enabled_in_state "$state"; then
+    atomic_install_file "$rendered" "$PORT_HOPPING_NFT_FILE" 0600
+  else
+    rm -f -- "$PORT_HOPPING_NFT_FILE"
+  fi
+}
+
+write_service_file() {
+  local temporary hopping_dependency=""
   temporary="$(mktemp /tmp/mb-singbox-service.XXXXXX)" || return 1
+  if port_hopping_enabled_in_state "$STATE_FILE"; then
+    hopping_dependency=$'Requires='"${PORT_HOPPING_SERVICE_NAME}"$'\nAfter='"${PORT_HOPPING_SERVICE_NAME}"
+  fi
   cat > "$temporary" <<EOF
 [Unit]
 Description=${MAIN_SERVICE_DESCRIPTION}
 Wants=network-online.target
 After=network-online.target nss-lookup.target
-
+${hopping_dependency}
 [Service]
 Type=simple
 User=root
@@ -601,7 +781,7 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 [Install]
 WantedBy=multi-user.target
 EOF
-  if ! atomic_install_file "$temporary" "$SERVICE_FILE" 0644; then
+  if ! atomic_install_file "$temporary" "$SERVICE_FILE" 0644 || ! write_port_hopping_service_file; then
     rm -f -- "$temporary"
     return 1
   fi
@@ -831,13 +1011,18 @@ make_outbound_json() {
         reality: {enabled: true, public_key: $n.public_key, short_id: $n.short_id}
       }
     }
-    elif $n.type == "hysteria2" then {
-      type: "hysteria2", tag: ("node-" + $n.id), server: $server, server_port: $n.port,
-      connect_timeout: "10s",
-      password: $n.password,
-      obfs: {type: "salamander", password: $n.obfs_password},
-      tls: {enabled: true, server_name: $n.tls_domain}
-    }
+    elif $n.type == "hysteria2" then
+      ({
+        type: "hysteria2", tag: ("node-" + $n.id), server: $server,
+        connect_timeout: "10s",
+        password: $n.password,
+        obfs: {type: "salamander", password: $n.obfs_password},
+        tls: {enabled: true, server_name: $n.tls_domain}
+      } +
+      (if ($n.port_hopping.enabled // false) then {
+        server_ports: [(($n.port_hopping.start | tostring) + ":" + ($n.port_hopping.end | tostring))],
+        hop_interval: (($n.port_hopping.hop_interval | tostring) + "s")
+      } else {server_port: $n.port} end))
     elif $n.type == "tuic" then {
       type: "tuic", tag: ("node-" + $n.id), server: $server, server_port: $n.port,
       connect_timeout: "10s",
@@ -991,7 +1176,7 @@ render_client_config() {
 node_share_link() {
   local node_json="$1" server="$2" argo_hostname="${3:-}"
   local connect_address="${4:-$argo_hostname}" argo_port="${5:-2096}" variant_label="${6:-}"
-  local type name port uri_host uuid password tls_domain path short_id public_key obfs vmess_json profile_name
+  local type name port uri_host uuid password tls_domain path short_id public_key obfs vmess_json profile_name mport_query
   type="$(jq -r '.type' <<<"$node_json")"
   name="$(jq -r '.name' <<<"$node_json")"
   port="$(jq -r '.port' <<<"$node_json")"
@@ -1019,8 +1204,12 @@ node_share_link() {
       password="$(jq -r '.password' <<<"$node_json")"
       tls_domain="$(jq -r '.tls_domain' <<<"$node_json")"
       obfs="$(jq -r '.obfs_password' <<<"$node_json")"
-      printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=0&obfs=salamander&obfs-password=%s#%s\n' \
-        "$(urlencode "$password")" "$uri_host" "$port" "$(urlencode "$tls_domain")" "$(urlencode "$obfs")" "$(urlencode "$name")"
+      mport_query=""
+      if jq -e '.port_hopping.enabled // false' <<<"$node_json" >/dev/null; then
+        mport_query="&mport=$(jq -r '.port_hopping | "\(.start)-\(.end)"' <<<"$node_json")"
+      fi
+      printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=0&obfs=salamander&obfs-password=%s%s#%s\n' \
+        "$(urlencode "$password")" "$uri_host" "$port" "$(urlencode "$tls_domain")" "$(urlencode "$obfs")" "$mport_query" "$(urlencode "$name")"
       ;;
     tuic)
       uuid="$(jq -r '.uuid' <<<"$node_json")"
@@ -1337,6 +1526,8 @@ backup_current() {
   cp -a -- "$STATE_FILE" "$target/state.json" || { rm -rf -- "$target"; return 1; }
   [[ ! -s "$SERVER_CONFIG" ]] || cp -a -- "$SERVER_CONFIG" "$target/server.json" || { rm -rf -- "$target"; return 1; }
   [[ ! -f "$SERVICE_FILE" ]] || cp -a -- "$SERVICE_FILE" "$target/service.unit" || { rm -rf -- "$target"; return 1; }
+  [[ ! -s "$PORT_HOPPING_NFT_FILE" ]] || cp -a -- "$PORT_HOPPING_NFT_FILE" "$target/port-hopping.nft" || { rm -rf -- "$target"; return 1; }
+  [[ ! -f "$PORT_HOPPING_SERVICE_FILE" ]] || cp -a -- "$PORT_HOPPING_SERVICE_FILE" "$target/port-hopping.service" || { rm -rf -- "$target"; return 1; }
   for item in clients links qrcodes; do
     case "$item" in
       clients) [[ ! -d "$CLIENT_DIR" ]] || cp -a -- "$CLIENT_DIR" "$target/$item" || { rm -rf -- "$target"; return 1; } ;;
@@ -1358,6 +1549,18 @@ restore_backup() {
   fi
   if [[ -s "$backup/service.unit" ]]; then
     atomic_install_file "$backup/service.unit" "$SERVICE_FILE" 0644 || return 1
+  else
+    rm -f -- "$SERVICE_FILE" || return 1
+  fi
+  if [[ -s "$backup/port-hopping.nft" ]]; then
+    atomic_install_file "$backup/port-hopping.nft" "$PORT_HOPPING_NFT_FILE" 0600 || return 1
+  else
+    rm -f -- "$PORT_HOPPING_NFT_FILE" || return 1
+  fi
+  if [[ -s "$backup/port-hopping.service" ]]; then
+    atomic_install_file "$backup/port-hopping.service" "$PORT_HOPPING_SERVICE_FILE" 0644 || return 1
+  else
+    rm -f -- "$PORT_HOPPING_SERVICE_FILE" || return 1
   fi
 
   temp_root="$(mktemp -d "${ROOT_DIR}/.restore.XXXXXX")" || return 1
@@ -1380,7 +1583,7 @@ prune_backups() {
 }
 
 apply_candidate_state() {
-  local candidate="$1" candidate_config backup
+  local candidate="$1" candidate_config candidate_hopping backup
   local service_was_active=0 service_was_enabled=0
   require_core || return 1
   state_valid "$candidate" || {
@@ -1388,20 +1591,27 @@ apply_candidate_state() {
     return 1
   }
   validate_state_certificates "$candidate" || return 1
+  check_port_hopping_rules "$candidate" || return 1
   candidate_config="$(mktemp "${ROOT_DIR}/.server.XXXXXX.json")" || return 1
+  candidate_hopping="$(mktemp "${ROOT_DIR}/.port-hopping.XXXXXX.nft")" || { rm -f -- "$candidate_config"; return 1; }
+  if port_hopping_enabled_in_state "$candidate"; then
+    render_port_hopping_nft "$candidate" "$candidate_hopping" || { rm -f -- "$candidate_config" "$candidate_hopping"; return 1; }
+  else
+    : > "$candidate_hopping"
+  fi
   render_server_config "$candidate" "$candidate_config" || {
-    rm -f -- "$candidate_config"
+    rm -f -- "$candidate_config" "$candidate_hopping"
     error "生成服务端候选配置失败。"
     return 1
   }
   if ! "$SINGBOX_BIN" check -c "$candidate_config"; then
-    rm -f -- "$candidate_config"
+    rm -f -- "$candidate_config" "$candidate_hopping"
     error "候选配置未通过 sing-box 检查，不会替换现有配置。"
     return 1
   fi
-  backup="$(backup_current)" || { rm -f -- "$candidate_config"; return 1; }
+  backup="$(backup_current)" || { rm -f -- "$candidate_config" "$candidate_hopping"; return 1; }
   if ! generate_outputs "$candidate"; then
-    rm -f -- "$candidate_config"
+    rm -f -- "$candidate_config" "$candidate_hopping"
     rm -rf -- "$backup"
     error "客户端配置生成失败，不会替换现有状态。"
     return 1
@@ -1409,16 +1619,25 @@ apply_candidate_state() {
   systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && service_was_active=1
   systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null && service_was_enabled=1
   if ! atomic_install_file "$candidate" "$STATE_FILE" 0600 ||
-     ! atomic_install_file "$candidate_config" "$SERVER_CONFIG" 0600; then
-    rm -f -- "$candidate_config"
+     ! atomic_install_file "$candidate_config" "$SERVER_CONFIG" 0600 ||
+     ! install_port_hopping_file_for_state "$candidate" "$candidate_hopping"; then
+    rm -f -- "$candidate_config" "$candidate_hopping"
     restore_backup "$backup" || warn "自动恢复不完整，请检查备份：${backup}"
-    error "状态或服务端配置替换失败，已恢复。"
+    sync_port_hopping_runtime >/dev/null 2>&1 || true
+    error "状态、服务端配置或端口跳跃规则替换失败，已恢复。"
     return 1
   fi
-  rm -f -- "$candidate_config"
+  rm -f -- "$candidate_config" "$candidate_hopping"
   if ! write_service_file; then
     restore_backup "$backup" || warn "自动恢复不完整，请检查备份：${backup}"
+    sync_port_hopping_runtime >/dev/null 2>&1 || true
     error "写入 systemd 服务失败，已恢复。"
+    return 1
+  fi
+  if ! sync_port_hopping_runtime; then
+    restore_backup "$backup" || warn "自动恢复不完整，请检查备份：${backup}"
+    sync_port_hopping_runtime >/dev/null 2>&1 || true
+    error "端口跳跃规则未能生效，已恢复原配置。"
     return 1
   fi
 
@@ -1438,6 +1657,7 @@ apply_candidate_state() {
 
   error "新配置启动失败，正在恢复上一个状态。"
   restore_backup "$backup" || warn "自动恢复不完整，请检查备份：${backup}"
+  sync_port_hopping_runtime >/dev/null 2>&1 || warn "原端口跳跃规则恢复失败，请运行 mb-singbox render。"
   if (( service_was_active )); then
     systemctl restart "$SERVICE_NAME" || true
   else
@@ -1479,8 +1699,10 @@ port_in_state() {
   local port="$1" network="$2"
   jq -e --argjson port "$port" --arg network "$network" '
     any(.nodes[];
-      .port == $port and
-      (if $network == "udp" then (.type == "hysteria2" or .type == "tuic") else (.type == "reality" or .type == "anytls" or .type == "vmess") end)
+      (.port == $port and
+       (if $network == "udp" then (.type == "hysteria2" or .type == "tuic") else (.type == "reality" or .type == "anytls" or .type == "vmess") end)) or
+      ($network == "udp" and .type == "hysteria2" and (.port_hopping.enabled // false) and
+       $port >= .port_hopping.start and $port <= .port_hopping.end)
     ) or (.argo.enabled and $network == "tcp" and .argo.origin_port == $port)
   ' "$STATE_FILE" >/dev/null
 }
@@ -1754,7 +1976,7 @@ add_tls_node() {
   path="/$(openssl rand -hex 8)"
   case "$type" in
     hysteria2)
-      node="$(jq -n --arg id "$id" --arg name "$name" --argjson port "$port" --arg password "$password" --arg obfs "$obfs" --arg domain "$CERT_DOMAIN" --arg cert "$CERT_FILE" --arg key "$KEY_FILE" '{id:$id,name:$name,type:"hysteria2",port:$port,password:$password,obfs_password:$obfs,tls_domain:$domain,certificate_path:$cert,key_path:$key}')"
+      node="$(jq -n --arg id "$id" --arg name "$name" --argjson port "$port" --arg password "$password" --arg obfs "$obfs" --arg domain "$CERT_DOMAIN" --arg cert "$CERT_FILE" --arg key "$KEY_FILE" '{id:$id,name:$name,type:"hysteria2",port:$port,password:$password,obfs_password:$obfs,tls_domain:$domain,certificate_path:$cert,key_path:$key,port_hopping:{enabled:false,start:0,end:0,hop_interval:30}}')"
       ;;
     tuic)
       node="$(jq -n --arg id "$id" --arg name "$name" --argjson port "$port" --arg uuid "$uuid" --arg password "$password" --arg domain "$CERT_DOMAIN" --arg cert "$CERT_FILE" --arg key "$KEY_FILE" '{id:$id,name:$name,type:"tuic",port:$port,uuid:$uuid,password:$password,tls_domain:$domain,certificate_path:$cert,key_path:$key}')"
@@ -1816,6 +2038,14 @@ show_node_result() {
   argo_preferred_link_file="${LINK_DIR}/${id}-argo-preferred.txt"
   printf '\n%s节点详情%s\n' "$C_BOLD" "$C_RESET"
   printf '名称：%s\n协议：%s\n端口：%s\n' "$name" "$type" "$port"
+  if [[ "$type" == "hysteria2" ]]; then
+    if jq -e '.port_hopping.enabled // false' <<<"$node" >/dev/null; then
+      printf '端口跳跃：已开启，UDP %s-%s，间隔 %s 秒\n' \
+        "$(jq -r '.port_hopping.start' <<<"$node")" "$(jq -r '.port_hopping.end' <<<"$node")" "$(jq -r '.port_hopping.hop_interval' <<<"$node")"
+    else
+      printf '端口跳跃：未开启\n'
+    fi
+  fi
   printf '官方 Desktop TUN 总配置：%s/sing-box-desktop.json\n' "$CLIENT_DIR"
   if [[ -s "$link_file" ]]; then
     printf '\n直连分享链接：\n'
@@ -1850,8 +2080,12 @@ list_nodes() {
     printf '尚未创建节点。\n'
     return 0
   fi
-  jq -r '.nodes | to_entries[] | [(.key+1|tostring), .value.name, .value.type, (.value.port|tostring), (if (.value.type=="hysteria2" or .value.type=="tuic") then "UDP" else "TCP" end), .value.id] | @tsv' "$STATE_FILE" | \
-    awk -F '\t' '{printf "%2s. %-18s  %-10s  %5s/%-3s  ID=%s\n", $1, $2, $3, $4, $5, $6}'
+  jq -r '.nodes | to_entries[] | [
+    (.key+1|tostring), .value.name, .value.type,
+    ((.value.port|tostring) + (if .value.type=="hysteria2" and (.value.port_hopping.enabled // false) then "+" + (.value.port_hopping.start|tostring) + "-" + (.value.port_hopping.end|tostring) else "" end)),
+    (if (.value.type=="hysteria2" or .value.type=="tuic") then "UDP" else "TCP" end), .value.id
+  ] | @tsv' "$STATE_FILE" | \
+    awk -F '\t' '{printf "%2s. %-18s  %-10s  %-17s/%-3s  ID=%s\n", $1, $2, $3, $4, $5, $6}'
   printf '\n客户端总配置：\n  Desktop TUN：%s/sing-box-desktop.json\n' "$CLIENT_DIR"
   printf '全部分享链接：%s/all.txt\n' "$LINK_DIR"
   if jq -e '.argo.enabled' "$STATE_FILE" >/dev/null; then
@@ -1901,8 +2135,10 @@ choose_port_for_node() {
       return 0
     elif jq -e --arg id "$node_id" --argjson port "$input" --arg network "$network" '
       any(.nodes[];
-        .id != $id and .port == $port and
-        (if $network == "udp" then (.type=="hysteria2" or .type=="tuic") else (.type=="reality" or .type=="anytls" or .type=="vmess") end)
+        (.id != $id and .port == $port and
+         (if $network == "udp" then (.type=="hysteria2" or .type=="tuic") else (.type=="reality" or .type=="anytls" or .type=="vmess") end)) or
+        ($network == "udp" and .type == "hysteria2" and (.port_hopping.enabled // false) and
+         $port >= .port_hopping.start and $port <= .port_hopping.end)
       ) or (.argo.enabled and $network=="tcp" and .argo.origin_port==$port)
     ' "$STATE_FILE" >/dev/null; then
       error "${network^^} ${input} 已被另一个 mb-singbox 入站使用。"
@@ -1931,6 +2167,141 @@ apply_node_field_update() {
   fi
 }
 
+hopping_range_in_state() {
+  local start="$1" end="$2" excluded_id="$3"
+  jq -e --arg id "$excluded_id" --argjson start "$start" --argjson end "$end" '
+    any(.nodes[];
+      ((.type == "hysteria2" or .type == "tuic") and .port >= $start and .port <= $end) or
+      (.id != $id and .type == "hysteria2" and (.port_hopping.enabled // false) and
+       .port_hopping.start <= $end and .port_hopping.end >= $start)
+    )
+  ' "$STATE_FILE" >/dev/null
+}
+
+udp_range_has_listener() {
+  local start="$1" end="$2"
+  ss -H -lun 2>/dev/null | awk -v start="$start" -v end="$end" '
+    {
+      endpoint=$4
+      sub(/^.*:/, "", endpoint)
+      if (endpoint ~ /^[0-9]+$/ && endpoint >= start && endpoint <= end) found=1
+    }
+    END {exit !found}
+  '
+}
+
+validate_hopping_range() {
+  local start="$1" end="$2" node_id="$3"
+  if ! validate_port "$start" || ! validate_port "$end" || (( start >= end )); then
+    error "端口范围必须是两个递增的 1 到 65535 整数。"
+    return 1
+  fi
+  if hopping_range_in_state "$start" "$end" "$node_id"; then
+    error "UDP ${start}-${end} 与现有节点端口或端口跳跃范围冲突。"
+    return 1
+  fi
+  if udp_range_has_listener "$start" "$end"; then
+    error "UDP ${start}-${end} 中已有系统程序监听端口。"
+    return 1
+  fi
+}
+
+pick_hopping_range() {
+  local node_id="$1" start end random_hex
+  for _ in {1..100}; do
+    random_hex="$(openssl rand -hex 4)" || return 1
+    start=$((20000 + 16#$random_hex % 39001))
+    end=$((start + 999))
+    if validate_hopping_range "$start" "$end" "$node_id" 2>/dev/null; then
+      printf '%s\t%s\n' "$start" "$end"
+      return 0
+    fi
+  done
+  error "尝试 100 次后仍无法找到可用的 1000 端口 UDP 范围。"
+  return 1
+}
+
+read_hopping_range() {
+  local node_id="$1" input start end
+  while true; do
+    read -r -p "请输入 UDP 端口范围（例如 20000-20999，输入 0 返回）：" input
+    [[ "$input" == "0" ]] && return 2
+    if [[ "$input" =~ ^([0-9]{1,5})[-:]([0-9]{1,5})$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+      if validate_hopping_range "$start" "$end" "$node_id"; then
+        printf '%s\t%s\n' "$start" "$end"
+        return 0
+      fi
+    else
+      error "格式不正确，请使用 起始端口-结束端口。"
+    fi
+  done
+}
+
+port_hopping_client_notice() {
+  info "V2rayN 分享链接、二维码和 sing-box-desktop.json 已刷新。"
+  warn "已导入客户端中的旧节点不会自动更新，请重新导入链接或重新下载 JSON。"
+}
+
+set_hysteria2_port_hopping() {
+  local id="$1" start="$2" end="$3"
+  warn "将开放并转发 UDP ${start}-${end}；云厂商安全组也必须放行该范围。"
+  confirm "确认启用此端口跳跃范围？" || return 0
+  if apply_node_field_update "$id" '.port_hopping={enabled:true,start:$start,end:$end,hop_interval:30}' \
+      --argjson start "$start" --argjson end "$end"; then
+    ok "Hysteria2 端口跳跃已启用：UDP ${start}-${end}，间隔 30 秒。"
+    port_hopping_client_notice
+  else
+    return 1
+  fi
+}
+
+edit_hysteria2_port_hopping() {
+  local id="$1" enabled choice range start end rc
+  enabled="$(jq -r --arg id "$id" '.nodes[] | select(.id==$id) | (.port_hopping.enabled // false)' "$STATE_FILE")"
+  printf '\nHysteria2 端口跳跃：\n'
+  if [[ "$enabled" == "true" ]]; then
+    printf '  当前：已开启，UDP %s-%s，间隔 %s 秒\n' \
+      "$(jq -r --arg id "$id" '.nodes[] | select(.id==$id) | .port_hopping.start' "$STATE_FILE")" \
+      "$(jq -r --arg id "$id" '.nodes[] | select(.id==$id) | .port_hopping.end' "$STATE_FILE")" \
+      "$(jq -r --arg id "$id" '.nodes[] | select(.id==$id) | .port_hopping.hop_interval' "$STATE_FILE")"
+    printf '  1. 重新随机范围\n  2. 自定义范围\n  3. 关闭端口跳跃\n  0. 返回\n'
+  else
+    printf '  当前：未开启（节点继续使用单端口）\n'
+    printf '  1. 自动开启（随机 1000 个连续高位端口）\n  2. 自定义范围\n  0. 返回\n'
+  fi
+  read -r -p "请选择：" choice
+  case "$choice" in
+    1)
+      range="$(pick_hopping_range "$id")" || return 1
+      IFS=$'\t' read -r start end <<<"$range"
+      set_hysteria2_port_hopping "$id" "$start" "$end"
+      ;;
+    2)
+      range="$(read_hopping_range "$id")"
+      rc=$?
+      (( rc == 2 )) && return 0
+      (( rc == 0 )) || return "$rc"
+      IFS=$'\t' read -r start end <<<"$range"
+      set_hysteria2_port_hopping "$id" "$start" "$end"
+      ;;
+    3)
+      [[ "$enabled" == "true" ]] || { error "无效选项。"; return 1; }
+      warn "关闭后，已导入客户端中的多端口配置将无法继续使用。"
+      confirm "确认关闭端口跳跃并恢复单端口输出？" || return 0
+      if apply_node_field_update "$id" '.port_hopping={enabled:false,start:0,end:0,hop_interval:30}'; then
+        ok "Hysteria2 端口跳跃已关闭，客户端输出已恢复单端口。"
+        port_hopping_client_notice
+      else
+        return 1
+      fi
+      ;;
+    0) return 0 ;;
+    *) error "无效选项。"; return 1 ;;
+  esac
+}
+
 edit_node() {
   local id node type network choice value port rc
   require_root
@@ -1954,6 +2325,7 @@ edit_node() {
   [[ "$type" == "reality" ]] && printf '  4. 修改 Reality 握手域名\n'
   [[ "$type" == "vmess" ]] && printf '  4. 修改 WebSocket 路径\n'
   printf '  5. 重新生成认证凭据\n'
+  [[ "$type" == "hysteria2" ]] && printf '  6. 端口跳跃设置\n'
   printf '  0. 返回\n'
   read -r -p "请选择：" choice
   case "$choice" in
@@ -2018,6 +2390,10 @@ edit_node() {
           apply_node_field_update "$id" '.uuid=$uuid | .path=$path' --arg uuid "$(new_uuid)" --arg path "/$(openssl rand -hex 8)"
           ;;
       esac
+      ;;
+    6)
+      [[ "$type" == "hysteria2" ]] || { error "该节点没有此选项。"; return 1; }
+      edit_hysteria2_port_hopping "$id"
       ;;
     0) return 0 ;;
     *) error "无效选项。"; return 1 ;;
@@ -2624,14 +3000,17 @@ remove_managed_ufw_rules() {
 }
 
 desired_ufw_rules() {
-  local type port protocol
-  while IFS=$'\t' read -r type port; do
+  local type port hop_start hop_end hop_enabled protocol
+  while IFS=$'\t' read -r type port hop_start hop_end hop_enabled; do
     case "$type" in
       hysteria2|tuic) protocol=udp ;;
       *) protocol=tcp ;;
     esac
     printf '%s\t%s\tmb-singbox %s %s\n' "$protocol" "$port" "${protocol^^}" "$port"
-  done < <(jq -r '.nodes[] | [.type, .port] | @tsv' "$STATE_FILE")
+    if [[ "$type" == "hysteria2" && "$hop_enabled" == "true" ]]; then
+      printf 'udp\t%s:%s\tmb-singbox Hysteria2 hopping %s-%s\n' "$hop_start" "$hop_end" "$hop_start" "$hop_end"
+    fi
+  done < <(jq -r '.nodes[] | [.type,.port,(.port_hopping.start // 0),(.port_hopping.end // 0),(.port_hopping.enabled // false)] | @tsv' "$STATE_FILE")
 }
 
 add_desired_ufw_rules() {
@@ -3017,6 +3396,8 @@ check_configuration() {
   [[ -s "$SERVER_CONFIG" ]] || { error "尚未生成服务端配置。"; return 1; }
   if [[ -s "$STATE_FILE" ]]; then
     validate_state_certificates "$STATE_FILE" || return 1
+    check_port_hopping_rules "$STATE_FILE" || return 1
+    check_installed_port_hopping_rules || return 1
   fi
   "$SINGBOX_BIN" check -c "$SERVER_CONFIG"
 }
@@ -3253,7 +3634,7 @@ uninstall_all() {
   init_state || return 1
   validate_managed_layout || return 1
   printf '\n%s彻底卸载范围%s\n' "$C_BOLD" "$C_RESET"
-  printf '将删除：MB sing-box 管理器服务、内核、状态、服务端/客户端配置、链接、二维码、备份、日志、cloudflared 本地服务、UFW 自建规则和 BBR sysctl 文件。\n'
+  printf '将删除：MB sing-box 管理器服务、内核、状态、服务端/客户端配置、链接、二维码、备份、日志、cloudflared 本地服务、Hysteria2 端口跳跃规则、UFW 自建规则和 BBR sysctl 文件。\n'
   printf '不会删除：MB-ACME、/etc/acme/certs、Cloudflare 远程 Named Tunnel、系统其他 UFW/sysctl 配置。\n'
   warn "该操作不可恢复，客户端配置和节点密钥也会被删除。"
   confirm "确认彻底卸载 MB sing-box 管理器？" || return 0
@@ -3267,7 +3648,8 @@ uninstall_all() {
   }
   stop_argo_service
   systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-  rm -f -- "$SERVICE_FILE"
+  stop_port_hopping_service
+  rm -f -- "$SERVICE_FILE" "$PORT_HOPPING_SERVICE_FILE" "$PORT_HOPPING_NFT_FILE"
   systemctl daemon-reload >/dev/null 2>&1 || true
   remove_managed_ufw_rules || warn "部分 UFW 规则未能自动删除。"
   rm -f -- "$BBR_FILE"
@@ -3285,13 +3667,14 @@ uninstall_all() {
 }
 
 show_status_line() {
-  local core service nodes argo firewall
+  local core service nodes argo firewall hopping
   core="$(current_core_version 2>/dev/null || printf '未安装')"
   if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then service="运行中"; else service="已停止"; fi
   nodes="$(jq '.nodes|length' "$STATE_FILE" 2>/dev/null || printf '0')"
+  hopping="$(jq '[.nodes[] | select(.type=="hysteria2" and (.port_hopping.enabled // false))] | length' "$STATE_FILE" 2>/dev/null || printf '0')"
   if jq -e '.argo.enabled' "$STATE_FILE" >/dev/null 2>&1; then argo="已启用"; else argo="未启用"; fi
   firewall="$(firewall_mode_label)"
-  printf 'sing-box：%s  服务：%s  节点：%s  Argo：%s  防火墙：%s\n' "$core" "$service" "$nodes" "$argo" "$firewall"
+  printf 'sing-box：%s  服务：%s  节点：%s  Hysteria2 跳跃：%s  Argo：%s  防火墙：%s\n' "$core" "$service" "$nodes" "$hopping" "$argo" "$firewall"
 }
 
 doctor() {
@@ -3445,6 +3828,8 @@ main() {
     update-manager) update_manager ;;
     check) require_root; check_configuration ;;
     render) require_root; regenerate_all_configs ;;
+    port-hopping-apply) require_root; apply_port_hopping_rules ;;
+    port-hopping-clear) require_root; clear_port_hopping_rules ;;
     status) require_root; init_state; show_status_line; list_nodes ;;
     doctor) require_root; doctor ;;
     version|--version|-v) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
