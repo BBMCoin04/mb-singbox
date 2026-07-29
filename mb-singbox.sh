@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.6.1"
+VERSION="0.7.0"
 PROGRAM="mb-singbox"
 MANAGER_UPDATE_APPLIED=0
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
@@ -358,7 +358,13 @@ state_valid() {
        ((.client | has("preferred_enabled") | not) or (.client.preferred_enabled | type == "boolean")) and
        ((.client.preferred_addresses // []) | type == "array" and all(.[]; nonempty)) and
        ((.client.preferred_results // {}) | type == "object") and
-       ((.client.preferred_last_probe_at // "") | text)))
+       ((.client.preferred_last_probe_at // "") | text) and
+       ((.client.mihomo // null) as $mihomo |
+         $mihomo == null or
+         (($mihomo | type == "object") and
+          ($mihomo.proxy_username | nonempty and test("^[A-Za-z0-9._-]{1,32}$")) and
+          ($mihomo.proxy_password | nonempty and length <= 128) and
+          ($mihomo.controller_secret | text and test("^[a-f0-9]{64}$"))))))
   ' "$state" >/dev/null 2>&1 || return 1
 
   server="$(jq -r '.server_address' "$state")" || return 1
@@ -378,8 +384,14 @@ state_valid() {
 }
 
 init_state() {
-  local normalized
+  local normalized mihomo_proxy_password="" mihomo_controller_secret=""
   ensure_directories || return 1
+  if [[ -s "$STATE_FILE" ]]; then
+    mihomo_proxy_password="$(jq -r '.client.mihomo.proxy_password // empty' "$STATE_FILE" 2>/dev/null || true)"
+    mihomo_controller_secret="$(jq -r '.client.mihomo.controller_secret // empty' "$STATE_FILE" 2>/dev/null || true)"
+  fi
+  [[ -n "$mihomo_proxy_password" ]] || mihomo_proxy_password="$(random_password)" || return 1
+  [[ "$mihomo_controller_secret" =~ ^[a-f0-9]{64}$ ]] || mihomo_controller_secret="$(openssl rand -hex 32)" || return 1
   if [[ -e "$STATE_FILE" ]]; then
     [[ -s "$STATE_FILE" ]] || {
       error "状态文件为空，拒绝自动覆盖：${STATE_FILE}"
@@ -390,7 +402,7 @@ init_state() {
       return 1
     }
     normalized="$(mktemp "${ROOT_DIR}/.state-normalize.XXXXXX.json")" || return 1
-    if ! jq '
+    if ! jq --arg mihomo_password "$mihomo_proxy_password" --arg mihomo_secret "$mihomo_controller_secret" '
       .firewall_mode //= (if .firewall_managed then "managed" else "external" end) |
       .argo.provisioned //= false |
       .argo.verified //= false |
@@ -407,7 +419,11 @@ init_state() {
         "one.one.one.one"
       ] |
       .client.preferred_results //= {} |
-      .client.preferred_last_probe_at //= ""
+      .client.preferred_last_probe_at //= "" |
+      .client.mihomo //= {} |
+      .client.mihomo.proxy_username //= "mihomo" |
+      .client.mihomo.proxy_password //= $mihomo_password |
+      .client.mihomo.controller_secret //= $mihomo_secret
     ' "$STATE_FILE" > "$normalized" || ! state_valid "$normalized"; then
       rm -f -- "$normalized"
       error "状态迁移失败，原文件保持不变：${STATE_FILE}"
@@ -423,7 +439,7 @@ init_state() {
   fi
 
   normalized="$(mktemp "${ROOT_DIR}/.state-initial.XXXXXX.json")" || return 1
-  if ! jq -n --arg now "$(date -u +%FT%TZ)" '{
+  if ! jq -n --arg now "$(date -u +%FT%TZ)" --arg mihomo_password "$mihomo_proxy_password" --arg mihomo_secret "$mihomo_controller_secret" '{
     schema: 1,
     server_address: "",
     created_at: $now,
@@ -451,7 +467,12 @@ init_state() {
         "one.one.one.one"
       ],
       preferred_results: {},
-      preferred_last_probe_at: ""
+      preferred_last_probe_at: "",
+      mihomo: {
+        proxy_username: "mihomo",
+        proxy_password: $mihomo_password,
+        controller_secret: $mihomo_secret
+      }
     }
   }' > "$normalized" || ! state_valid "$normalized" || ! atomic_install_file "$normalized" "$STATE_FILE" 0600; then
     rm -f -- "$normalized"
@@ -1054,6 +1075,362 @@ make_outbound_json() {
     end'
 }
 
+make_mihomo_proxy_json() {
+  local node_json="$1" server_address="$2" argo_hostname="${3:-}"
+  local connect_address="${4:-$argo_hostname}" argo_port="${5:-2096}" variant="${6:-}"
+  jq -n --argjson n "$node_json" --arg server "$server_address" --arg argo "$argo_hostname" \
+    --arg connect "$connect_address" --argjson argo_port "$argo_port" --arg variant "$variant" '
+    if $argo != "" then {
+      name: ($n.name + "-Argo" + (if $variant == "preferred" then "-Preferred" else "" end) + " [" + $n.id + "]"),
+      _tier: "emergency", type: "vmess", server: $connect, port: $argo_port,
+      uuid: $n.uuid, alterId: 0, cipher: "auto", udp: true,
+      tls: true, servername: $argo, "client-fingerprint": "chrome", "skip-cert-verify": false,
+      network: "ws", "ws-opts": {path: $n.path, headers: {Host: $argo}}
+    }
+    elif $n.type == "reality" then {
+      name: ($n.name + " [" + $n.id + "]"), _tier: "main",
+      type: "vless", server: $server, port: $n.port, uuid: $n.uuid,
+      network: "tcp", tls: true, udp: true, flow: "xtls-rprx-vision",
+      servername: $n.server_name, "client-fingerprint": "chrome", "skip-cert-verify": false,
+      "reality-opts": {"public-key": $n.public_key, "short-id": $n.short_id}
+    }
+    elif $n.type == "hysteria2" then
+      ({
+        name: ($n.name + " [" + $n.id + "]"), _tier: "main",
+        type: "hysteria2", server: $server, password: $n.password, udp: true,
+        obfs: "salamander", "obfs-password": $n.obfs_password,
+        sni: $n.tls_domain, "skip-cert-verify": false, alpn: ["h3"]
+      } +
+      (if ($n.port_hopping.enabled // false) then {
+        ports: (($n.port_hopping.start | tostring) + "-" + ($n.port_hopping.end | tostring)),
+        "hop-interval": $n.port_hopping.hop_interval
+      } else {port: $n.port} end))
+    elif $n.type == "tuic" then {
+      name: ($n.name + " [" + $n.id + "]"), _tier: "backup",
+      type: "tuic", server: $server, port: $n.port,
+      uuid: $n.uuid, password: $n.password, udp: true,
+      "udp-relay-mode": "native", "congestion-controller": "bbr", "reduce-rtt": false,
+      alpn: ["h3"], sni: $n.tls_domain, "skip-cert-verify": false
+    }
+    elif $n.type == "anytls" then {
+      name: ($n.name + " [" + $n.id + "]"), _tier: "backup",
+      type: "anytls", server: $server, port: $n.port,
+      password: $n.password, udp: true, "client-fingerprint": "chrome",
+      sni: $n.tls_domain, "skip-cert-verify": false,
+      "idle-session-check-interval": 30, "idle-session-timeout": 30, "min-idle-session": 0
+    }
+    elif $n.type == "vmess" then empty
+    else error("unsupported mihomo node type")
+    end'
+}
+
+yaml_quote() {
+  jq -nr --arg value "$1" '$value | @json'
+}
+
+render_mihomo_proxy_yaml() {
+  local proxy="$1" type
+  type="$(jq -r '.type' <<<"$proxy")"
+  printf '  - name: %s\n' "$(jq -r '.name | @json' <<<"$proxy")"
+  printf '    type: %s\n' "$type"
+  printf '    server: %s\n' "$(jq -r '.server | @json' <<<"$proxy")"
+  case "$type" in
+    vless)
+      printf '    port: %s\n' "$(jq -r '.port' <<<"$proxy")"
+      printf '    uuid: %s\n' "$(jq -r '.uuid | @json' <<<"$proxy")"
+      printf '    network: tcp\n    tls: true\n    udp: true\n    flow: xtls-rprx-vision\n'
+      printf '    servername: %s\n' "$(jq -r '.servername | @json' <<<"$proxy")"
+      printf '    client-fingerprint: chrome\n    skip-cert-verify: false\n'
+      printf '    reality-opts:\n'
+      printf '      public-key: %s\n' "$(jq -r '."reality-opts"."public-key" | @json' <<<"$proxy")"
+      printf '      short-id: %s\n' "$(jq -r '."reality-opts"."short-id" | @json' <<<"$proxy")"
+      ;;
+    hysteria2)
+      if jq -e 'has("ports")' <<<"$proxy" >/dev/null; then
+        printf '    ports: %s\n' "$(jq -r '.ports | @json' <<<"$proxy")"
+        printf '    hop-interval: %s\n' "$(jq -r '."hop-interval"' <<<"$proxy")"
+      else
+        printf '    port: %s\n' "$(jq -r '.port' <<<"$proxy")"
+      fi
+      printf '    password: %s\n' "$(jq -r '.password | @json' <<<"$proxy")"
+      printf '    udp: true\n    obfs: salamander\n'
+      printf '    obfs-password: %s\n' "$(jq -r '."obfs-password" | @json' <<<"$proxy")"
+      printf '    sni: %s\n' "$(jq -r '.sni | @json' <<<"$proxy")"
+      printf '    alpn: [h3]\n    skip-cert-verify: false\n'
+      ;;
+    tuic)
+      printf '    port: %s\n' "$(jq -r '.port' <<<"$proxy")"
+      printf '    uuid: %s\n' "$(jq -r '.uuid | @json' <<<"$proxy")"
+      printf '    password: %s\n' "$(jq -r '.password | @json' <<<"$proxy")"
+      printf '    udp: true\n    udp-relay-mode: native\n    congestion-controller: bbr\n    reduce-rtt: false\n'
+      printf '    sni: %s\n' "$(jq -r '.sni | @json' <<<"$proxy")"
+      printf '    alpn: [h3]\n    skip-cert-verify: false\n'
+      ;;
+    anytls)
+      printf '    port: %s\n' "$(jq -r '.port' <<<"$proxy")"
+      printf '    password: %s\n' "$(jq -r '.password | @json' <<<"$proxy")"
+      printf '    udp: true\n    client-fingerprint: chrome\n'
+      printf '    sni: %s\n' "$(jq -r '.sni | @json' <<<"$proxy")"
+      printf '    skip-cert-verify: false\n'
+      printf '    idle-session-check-interval: 30\n    idle-session-timeout: 30\n    min-idle-session: 0\n'
+      ;;
+    vmess)
+      printf '    port: %s\n' "$(jq -r '.port' <<<"$proxy")"
+      printf '    uuid: %s\n' "$(jq -r '.uuid | @json' <<<"$proxy")"
+      printf '    alterId: 0\n    cipher: auto\n    udp: true\n    tls: true\n'
+      printf '    servername: %s\n' "$(jq -r '.servername | @json' <<<"$proxy")"
+      printf '    client-fingerprint: chrome\n    skip-cert-verify: false\n    network: ws\n'
+      printf '    ws-opts:\n      path: %s\n' "$(jq -r '."ws-opts".path | @json' <<<"$proxy")"
+      printf '      headers:\n        Host: %s\n' "$(jq -r '."ws-opts".headers.Host | @json' <<<"$proxy")"
+      ;;
+    *) error "无法渲染 Mihomo 节点类型：${type}"; return 1 ;;
+  esac
+}
+
+emit_mihomo_health_group() {
+  local name="$1" type="$2" hidden="$3"
+  shift 3
+  printf '  - name: %s\n    type: %s\n    proxies:\n' "$(yaml_quote "$name")" "$type"
+  local proxy_name
+  for proxy_name in "$@"; do
+    printf '      - %s\n' "$(yaml_quote "$proxy_name")"
+  done
+  printf '    url: https://www.gstatic.com/generate_204\n'
+  printf '    interval: 600\n    lazy: true\n    timeout: 5000\n    max-failed-times: 3\n    expected-status: 204\n'
+  [[ "$hidden" != "true" ]] || printf '    hidden: true\n'
+}
+
+render_mihomo_config() {
+  local state="$1" proxies_file="$2" output="$3"
+  local proxy_username proxy_password controller_secret proxy
+  local -a main_names=() backup_names=() emergency_names=() all_names=() tier_groups=()
+  state_valid "$state" || { error "拒绝从无效状态生成 Mihomo 配置。"; return 1; }
+  jq -e 'type == "array" and length > 0' "$proxies_file" >/dev/null || return 1
+
+  proxy_username="$(jq -r '.client.mihomo.proxy_username // empty' "$state")"
+  proxy_password="$(jq -r '.client.mihomo.proxy_password // empty' "$state")"
+  controller_secret="$(jq -r '.client.mihomo.controller_secret // empty' "$state")"
+  if [[ ! "$proxy_username" =~ ^[A-Za-z0-9._-]{1,32}$ || -z "$proxy_password" || ! "$controller_secret" =~ ^[a-f0-9]{64}$ ]]; then
+    error "Mihomo 认证信息尚未初始化，请先运行状态迁移。"
+    return 1
+  fi
+  mapfile -t main_names < <(jq -r '.[] | select(._tier == "main") | .name' "$proxies_file")
+  mapfile -t backup_names < <(jq -r '.[] | select(._tier == "backup") | .name' "$proxies_file")
+  mapfile -t emergency_names < <(jq -r '.[] | select(._tier == "emergency") | .name' "$proxies_file")
+  mapfile -t all_names < <(jq -r '.[] | select(._tier == "main"), select(._tier == "backup"), select(._tier == "emergency") | .name' "$proxies_file")
+
+  (( ${#main_names[@]} == 0 )) || tier_groups+=("主力测速")
+  (( ${#backup_names[@]} == 0 )) || tier_groups+=("备用测速")
+  (( ${#emergency_names[@]} == 0 )) || tier_groups+=("应急通道")
+  (( ${#tier_groups[@]} > 0 && ${#all_names[@]} > 0 )) || return 1
+
+  {
+    cat <<EOF
+# Generated by MB sing-box manager. Optimized for Mihomo/Nikki on OpenWrt.
+# Reality and Hysteria2 are primary; TUIC and AnyTLS are backup; Argo is emergency only.
+
+mixed-port: 7890
+redir-port: 7892
+tproxy-port: 7893
+allow-lan: true
+bind-address: "*"
+lan-allowed-ips:
+  - 127.0.0.0/8
+  - 10.0.0.0/8
+  - 100.64.0.0/10
+  - 169.254.0.0/16
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  - ::1/128
+  - fc00::/7
+  - fe80::/10
+authentication:
+  - $(yaml_quote "${proxy_username}:${proxy_password}")
+skip-auth-prefixes:
+  - 127.0.0.0/8
+  - ::1/128
+
+mode: rule
+log-level: info
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: off
+keep-alive-idle: 30
+keep-alive-interval: 30
+disable-keep-alive: false
+
+external-controller: 127.0.0.1:9090
+secret: $(yaml_quote "$controller_secret")
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  override-destination: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+  skip-dst-address:
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 100.64.0.0/10
+    - 169.254.0.0/16
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - ::1/128
+    - fc00::/7
+    - fe80::/10
+
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: false
+  prefer-h3: false
+  respect-rules: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter-mode: rule
+  fake-ip-filter:
+    - RULE-SET,private-domain,real-ip
+    - DOMAIN,localhost,real-ip
+    - DOMAIN-SUFFIX,lan,real-ip
+    - DOMAIN-SUFFIX,local,real-ip
+    - DOMAIN-SUFFIX,home.arpa,real-ip
+    - DOMAIN-SUFFIX,msftconnecttest.com,real-ip
+    - DOMAIN-SUFFIX,msftncsi.com,real-ip
+    - MATCH,fake-ip
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  proxy-server-nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  direct-nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  direct-nameserver-follow-policy: false
+  nameserver:
+    - "https://1.1.1.1/dns-query#故障转移"
+    - "https://8.8.8.8/dns-query#故障转移"
+  nameserver-policy:
+    "rule-set:private-domain":
+      - https://dns.alidns.com/dns-query
+      - https://doh.pub/dns-query
+    "rule-set:cn-domain":
+      - https://dns.alidns.com/dns-query
+      - https://doh.pub/dns-query
+    "rule-set:geolocation-not-cn":
+      - "https://1.1.1.1/dns-query#故障转移"
+      - "https://8.8.8.8/dns-query#故障转移"
+
+proxies:
+EOF
+    while IFS= read -r proxy; do
+      render_mihomo_proxy_yaml "$proxy" || return 1
+    done < <(jq -c '.[]' "$proxies_file")
+
+    printf '\nproxy-groups:\n'
+    (( ${#main_names[@]} == 0 )) || emit_mihomo_health_group "主力测速" url-test true "${main_names[@]}"
+    (( ${#backup_names[@]} == 0 )) || emit_mihomo_health_group "备用测速" url-test true "${backup_names[@]}"
+    (( ${#emergency_names[@]} == 0 )) || emit_mihomo_health_group "应急通道" fallback true "${emergency_names[@]}"
+    emit_mihomo_health_group "自动选择" fallback false "${tier_groups[@]}"
+    emit_mihomo_health_group "故障转移" fallback false "${all_names[@]}"
+
+    printf '  - name: %s\n    type: select\n    proxies:\n' "$(yaml_quote "手动选择")"
+    printf '      - %s\n      - %s\n' "$(yaml_quote "自动选择")" "$(yaml_quote "故障转移")"
+    for proxy in "${all_names[@]}"; do
+      printf '      - %s\n' "$(yaml_quote "$proxy")"
+    done
+    printf '      - DIRECT\n'
+
+    cat <<'EOF'
+
+rule-providers:
+  private-domain:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/private.mrs
+    path: ./ruleset/private-domain.mrs
+    interval: 86400
+    proxy: 故障转移
+  cn-domain:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/cn.mrs
+    path: ./ruleset/cn-domain.mrs
+    interval: 86400
+    proxy: 故障转移
+  geolocation-not-cn:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/geolocation-!cn.mrs"
+    path: ./ruleset/geolocation-not-cn.mrs
+    interval: 86400
+    proxy: 故障转移
+  private-ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/private.mrs
+    path: ./ruleset/private-ip.mrs
+    interval: 86400
+    proxy: 故障转移
+  cn-ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.mrs
+    path: ./ruleset/cn-ip.mrs
+    interval: 86400
+    proxy: 故障转移
+
+rules:
+  - RULE-SET,private-domain,DIRECT
+  - RULE-SET,cn-domain,DIRECT
+  - RULE-SET,geolocation-not-cn,手动选择
+  - RULE-SET,private-ip,DIRECT,no-resolve
+  - RULE-SET,cn-ip,DIRECT,no-resolve
+  - MATCH,手动选择
+EOF
+  } > "$output"
+}
+
+validate_mihomo_config() {
+  local config="$1" check_output rc=0
+  [[ -s "$config" ]] || { error "Mihomo 配置为空：${config}"; return 1; }
+  if grep -Eq 'CHANGE_ME|global-client-fingerprint' "$config"; then
+    error "Mihomo 配置包含占位符或已移除字段。"
+    return 1
+  fi
+  for required in '^proxies:' '^proxy-groups:' '^rule-providers:' '^rules:'; do
+    grep -Eq "$required" "$config" || { error "Mihomo 配置缺少必要部分：${required}"; return 1; }
+  done
+
+  if command -v mihomo >/dev/null 2>&1; then
+    check_output="$(mktemp /tmp/mb-singbox-mihomo-check.XXXXXX)" || return 1
+    mihomo -t -f "$config" > "$check_output" 2>&1 || rc=$?
+    if (( rc != 0 )) || grep -Eq 'level=(error|"error")|configuration is removed' "$check_output"; then
+      cat "$check_output" >&2
+      rm -f -- "$check_output"
+      error "Mihomo 配置未通过本机内核检查。"
+      return 1
+    fi
+    rm -f -- "$check_output"
+  fi
+}
+
 render_client_config() {
   local outbounds_file="$1" output="$2"
   jq -n --slurpfile proxies "$outbounds_file" '
@@ -1406,7 +1783,7 @@ swap_generated_outputs() {
 }
 
 generate_outputs() {
-  local state="$1" temp_root server client_server node_json id name link link_file argo_hostname="" outbound
+  local state="$1" temp_root server client_server node_json id name link link_file argo_hostname="" outbound mihomo_proxy
   local preferred_key="" argo_preferred_address="" argo_path="" argo_port=2096
   local core_version
   ensure_directories || return 1
@@ -1425,6 +1802,7 @@ generate_outputs() {
   fi
 
   printf '[]\n' > "$temp_root/all-outbounds.json" || { rm -rf -- "$temp_root"; return 1; }
+  printf '[]\n' > "$temp_root/all-mihomo-proxies.json" || { rm -rf -- "$temp_root"; return 1; }
   while IFS= read -r node_json; do
     id="$(jq -r '.id' <<<"$node_json")"
     name="$(jq -r '.name' <<<"$node_json")"
@@ -1444,6 +1822,13 @@ generate_outputs() {
     outbound="$(make_outbound_json "$node_json" "$client_server")" || { rm -rf -- "$temp_root"; return 1; }
     if ! jq --argjson outbound "$outbound" '. + [$outbound]' "$temp_root/all-outbounds.json" > "$temp_root/all-outbounds.next" ||
        ! mv -f -- "$temp_root/all-outbounds.next" "$temp_root/all-outbounds.json"; then
+      rm -rf -- "$temp_root"
+      return 1
+    fi
+    mihomo_proxy="$(make_mihomo_proxy_json "$node_json" "$client_server")" || { rm -rf -- "$temp_root"; return 1; }
+    if [[ -n "$mihomo_proxy" ]] &&
+       { ! jq --argjson proxy "$mihomo_proxy" '. + [$proxy]' "$temp_root/all-mihomo-proxies.json" > "$temp_root/all-mihomo-proxies.next" ||
+         ! mv -f -- "$temp_root/all-mihomo-proxies.next" "$temp_root/all-mihomo-proxies.json"; }; then
       rm -rf -- "$temp_root"
       return 1
     fi
@@ -1468,6 +1853,12 @@ generate_outputs() {
         rm -rf -- "$temp_root"
         return 1
       fi
+      mihomo_proxy="$(make_mihomo_proxy_json "$node_json" "$server" "$argo_hostname" "$argo_hostname" "$argo_port")" || { rm -rf -- "$temp_root"; return 1; }
+      if ! jq --argjson proxy "$mihomo_proxy" '. + [$proxy]' "$temp_root/all-mihomo-proxies.json" > "$temp_root/all-mihomo-proxies.next" ||
+         ! mv -f -- "$temp_root/all-mihomo-proxies.next" "$temp_root/all-mihomo-proxies.json"; then
+        rm -rf -- "$temp_root"
+        return 1
+      fi
 
       preferred_key="argo:${id}"
       argo_preferred_address="$(saved_preferred_address "$state" "$preferred_key" "$argo_hostname" "$argo_port" "$argo_path")"
@@ -1482,6 +1873,12 @@ generate_outputs() {
           rm -rf -- "$temp_root"
           return 1
         fi
+        mihomo_proxy="$(make_mihomo_proxy_json "$node_json" "$server" "$argo_hostname" "$argo_preferred_address" "$argo_port" "preferred")" || { rm -rf -- "$temp_root"; return 1; }
+        if ! jq --argjson proxy "$mihomo_proxy" '. + [$proxy]' "$temp_root/all-mihomo-proxies.json" > "$temp_root/all-mihomo-proxies.next" ||
+           ! mv -f -- "$temp_root/all-mihomo-proxies.next" "$temp_root/all-mihomo-proxies.json"; then
+          rm -rf -- "$temp_root"
+          return 1
+        fi
       fi
     fi
   fi
@@ -1489,7 +1886,11 @@ generate_outputs() {
   if [[ "$(jq 'length' "$temp_root/all-outbounds.json")" -gt 0 ]]; then
     render_client_config "$temp_root/all-outbounds.json" "$temp_root/clients/sing-box-desktop.json" || { rm -rf "$temp_root"; return 1; }
   fi
-  rm -f "$temp_root/all-outbounds.json"
+  if [[ "$(jq 'length' "$temp_root/all-mihomo-proxies.json")" -gt 0 ]]; then
+    render_mihomo_config "$state" "$temp_root/all-mihomo-proxies.json" "$temp_root/clients/mihomo-nikki.yaml" || { rm -rf "$temp_root"; return 1; }
+    validate_mihomo_config "$temp_root/clients/mihomo-nikki.yaml" || { rm -rf "$temp_root"; return 1; }
+  fi
+  rm -f "$temp_root/all-outbounds.json" "$temp_root/all-mihomo-proxies.json"
 
   local client_config client_name client_min_version
   while IFS= read -r client_config; do
@@ -2047,7 +2448,8 @@ show_node_result() {
       printf '端口跳跃：未开启\n'
     fi
   fi
-  printf '官方 Desktop TUN 总配置：%s/sing-box-desktop.json\n' "$CLIENT_DIR"
+  printf '官方 Desktop TUN：%s/sing-box-desktop.json\n' "$CLIENT_DIR"
+  [[ ! -s "$CLIENT_DIR/mihomo-nikki.yaml" ]] || printf 'Mihomo/Nikki YAML：%s/mihomo-nikki.yaml\n' "$CLIENT_DIR"
   if [[ -s "$link_file" ]]; then
     printf '\n直连分享链接：\n'
     cat "$link_file"
@@ -2088,6 +2490,7 @@ list_nodes() {
   ] | @tsv' "$STATE_FILE" | \
     awk -F '\t' '{printf "%2s. %-18s  %-10s  %-17s/%-3s  ID=%s\n", $1, $2, $3, $4, $5, $6}'
   printf '\n客户端总配置：\n  Desktop TUN：%s/sing-box-desktop.json\n' "$CLIENT_DIR"
+  [[ ! -s "$CLIENT_DIR/mihomo-nikki.yaml" ]] || printf '  Mihomo/Nikki：%s/mihomo-nikki.yaml\n' "$CLIENT_DIR"
   printf '全部分享链接：%s/all.txt\n' "$LINK_DIR"
   if jq -e '.argo.enabled' "$STATE_FILE" >/dev/null; then
     printf 'Argo：%s，%s，%s\n' \
@@ -2241,8 +2644,8 @@ read_hopping_range() {
 }
 
 port_hopping_client_notice() {
-  info "V2rayN 分享链接、二维码和 sing-box-desktop.json 已刷新。"
-  warn "已导入客户端中的旧节点不会自动更新，请重新导入链接或重新下载 JSON。"
+  info "分享链接、二维码、Desktop JSON 和 Mihomo/Nikki YAML 已刷新。"
+  warn "已导入客户端中的旧配置不会自动更新，请重新导入或重新下载配置。"
 }
 
 set_hysteria2_port_hopping() {
@@ -2415,7 +2818,7 @@ delete_node() {
   (( rc == 2 )) && return 0
   (( rc == 0 )) || return "$rc"
   jq -e --arg id "$id" '.argo.enabled and .argo.node_id == $id' "$STATE_FILE" >/dev/null && argo_bound=1
-  warn "将删除节点 ${id} 的服务端配置、桌面配置、链接和二维码。"
+  warn "将删除节点 ${id} 的服务端配置、客户端 JSON/YAML、链接和二维码。"
   (( argo_bound )) && warn "该节点绑定了 Argo，Argo 本地服务也会停止；不会删除 Cloudflare 远程 Tunnel。"
   confirm "确定删除？" || return 0
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
@@ -3387,7 +3790,7 @@ regenerate_all_configs() {
   if apply_candidate_state "$candidate"; then
     rm -f "$candidate"
     sync_firewall_if_managed
-    ok "服务端和桌面配置已重新生成、校验并应用。"
+    ok "服务端、Desktop JSON 和 Mihomo/Nikki YAML 已重新生成并应用。"
   else
     rm -f "$candidate"
     return 1

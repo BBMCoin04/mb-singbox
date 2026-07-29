@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-INSTALLER_VERSION="0.6.1"
+INSTALLER_VERSION="0.7.0"
 DEFAULT_REPO="BBMCoin04/mb-singbox"
 REPO="${MB_SINGBOX_REPO:-$DEFAULT_REPO}"
 REF="${MB_SINGBOX_REF:-main}"
@@ -137,6 +137,10 @@ fi
 MANAGER_VERSION="$(awk -F '"' '/^VERSION="[0-9]/{print $2; exit}' "$TEMP_FILE")"
 if [[ ! "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   error "无法识别管理器版本，拒绝安装。"
+  exit 1
+fi
+if [[ "$MANAGER_VERSION" != "$INSTALLER_VERSION" ]]; then
+  error "安装器版本 ${INSTALLER_VERSION} 与主程序版本 ${MANAGER_VERSION} 不一致，拒绝安装。"
   exit 1
 fi
 info "准备安装 MB sing-box 管理器 ${MANAGER_VERSION}"

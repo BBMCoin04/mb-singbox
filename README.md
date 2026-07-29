@@ -1,6 +1,6 @@
 # MB sing-box 管理器
 
-MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.6.1`。
+MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.7.0`。
 
 命名约定：`MB` 只作为项目系列前缀，不另行展开；用户界面统一使用“MB sing-box 管理器”，技术标识统一使用 `mb-singbox`，上游内核统一写作 `sing-box`。主命令是 `mb-singbox`；旧命令 `singbox` 仅作为兼容别名保留。
 
@@ -57,7 +57,7 @@ sudo bash install.sh
 3. 进入菜单 `8 -> 3`，选择防火墙模式。节点机和 Docker 主机可选择宽松模式。
 4. 在云厂商控制台确认安全组没有拦截节点端口。
 5. 进入菜单 `3`，查看分享链接和客户端配置路径。
-6. 把客户端 JSON 下载到对应设备，或扫描二维码导入节点。
+6. Desktop 使用 JSON；Nikki/OpenWrt 使用 `mihomo-nikki.yaml`；也可以扫描二维码导入单节点。
 
 ## 默认端口
 
@@ -81,9 +81,9 @@ Hysteria2 创建时仍使用单端口。需要时进入菜单 `4 -> 选择 Hyste
 - 自动开启会从 `20000-59999` 随机选择 1000 个连续 UDP 端口，跳跃间隔固定为 30 秒
 - 也可以输入自定义连续端口范围，脚本会检查现有 UDP 节点、其他跳跃范围和系统监听端口冲突
 - sing-box 服务端继续监听节点原端口，独立的 `mb-singbox-port-hopping.service` 使用项目专属 nftables table 将跳跃范围转发到该端口
-- 开启、重新随机或关闭成功后，会自动刷新 `sing-box-desktop.json`、V2rayN `mport` 分享链接、`all.txt` 和二维码
-- 输出目录只保留当前有效版本；关闭后 JSON 和分享链接自动恢复单端口，不同时保留两套配置
-- VPS 上的输出会自动刷新，但已导入 V2rayN 的节点不会自动变化；每次开关或重新随机后都需要重新导入链接，JSON 用户需要重新下载文件
+- 开启、重新随机或关闭成功后，会自动刷新 Desktop JSON、Mihomo/Nikki YAML、V2rayN `mport` 分享链接、`all.txt` 和二维码
+- 输出目录只保留当前有效版本；关闭后配置和分享链接自动恢复单端口，不同时保留两套配置
+- VPS 上的输出会自动刷新，但已导入客户端的配置不会自动变化；每次调整后需要重新导入或下载配置
 - V2rayN 建议为 Hysteria2 选择 sing-box 内核；部分 Xray 版本使用 `mport` 时可能无法联网
 
 首次开启时如果缺少 `nft`，脚本会安装 nftables，但不会主动启用或覆盖系统的全局 nftables 配置。脚本只维护 `table inet mb_singbox_port_hopping`，停止主服务、关闭端口跳跃、删除节点和卸载时都会清理对应规则。
@@ -144,17 +144,35 @@ journalctl -u mb-singbox -n 50 --no-pager
 
 ```text
 /etc/mb-singbox/clients/sing-box-desktop.json
+/etc/mb-singbox/clients/mihomo-nikki.yaml
 /etc/mb-singbox/links/all.txt
 /etc/mb-singbox/qrcodes/
 ```
 
-- Desktop TUN：供官方 sing-box for Desktop `1.14.0+` 使用，通过双栈 TUN 接管 IPv4、IPv6、TCP、UDP 和 DNS 流量
-- Desktop 出站组：`auto` 自动测试全部节点；`manual` 默认使用 `auto`，也可手动固定任一节点
-- Desktop DNS：使用独立 bootstrap、国内 DoH、代理 DoH 和双栈 FakeIP；域名解析优先 IPv4，IPv4 不可用时允许回退 IPv6
-- 规则集：通过独立直连 HTTP client 下载 SagerNet 官方 geosite/geoip 二进制规则的 CDN 镜像，不依赖代理组启动
-- 分享输出：继续生成 `all.txt`、每个节点的单独链接和二维码
+### Desktop JSON
 
-Desktop 配置不启用 Windows 系统代理，也不额外开放本地 mixed 入站。项目不再生成软路由 JSON，不向下兼容 sing-box `1.13.x`。
+供官方 sing-box for Desktop `1.14.0+` 使用，通过双栈 TUN 接管 IPv4、IPv6、TCP、UDP 和 DNS。
+
+### Mihomo/Nikki YAML
+
+主要用于 Nikki/OpenWrt，也可导入支持 Mihomo 的 Windows 客户端。只显示三个策略组：
+
+- `自动选择`：Reality/Hysteria2 主力优先，其次 TUIC/AnyTLS，最后 Argo
+- `手动选择`：手动选择任意节点
+- `故障转移`：按主力、备用、Argo 顺序切换
+
+节点输出规则：
+
+- Reality、Hysteria2 是主力节点
+- Hysteria2 自动输出 Salamander 和多端口跳跃范围
+- TUIC、AnyTLS 是备用节点
+- 只输出 Argo VMess 应急入口，不输出 VMess 直连
+- 使用官方 MetaCubeX MRS 规则，国内和私有地址直连，其他流量进入 `手动选择`
+- 默认关闭 IPv6，避免软路由 IPv6 未接管时绕过代理
+
+Nikki 建议选择 TPROXY，并让插件接管 DNS 劫持到配置中的 `1053` 端口。WAN 不应开放 `7890`、`7892`、`7893`、`9090` 或 `1053`。YAML 内的代理认证密码和控制器密钥会首次自动生成并保持不变。
+
+Windows 客户端可能覆写本地端口、系统代理、TUN 和控制器设置，这是正常行为。
 
 ## Argo
 
@@ -171,7 +189,7 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 
 ## 更新与备份
 
-从 `0.3.x`、`0.4.2`、`0.4.3`、`0.5.0`、`0.5.1`、`0.5.2`、`0.5.3`、`0.5.4` 或 `0.5.5` 更新到 `0.6.1` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。现有 Hysteria2 节点迁移后保持单端口，不会自动开启端口跳跃。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
+从旧版本更新到 `0.7.0` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。现有 Hysteria2 节点迁移后保持单端口，不会自动开启端口跳跃。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
 
 `0.5.2` 起，重新生成配置时会先备份现有客户端、链接和二维码目录，只生成 `sing-box-desktop.json`。旧的 `sing-box-router.json` 会随客户端目录替换而移除；`all.txt`、每个节点的单独链接和二维码继续生成。
 
@@ -184,6 +202,8 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 `0.6.0` 起，Hysteria2 可以在修改节点菜单中按需开启端口跳跃。脚本自动生成或校验 UDP 范围，通过独立最小权限 systemd 服务管理 nftables 转发，并将规则、服务文件、客户端 JSON、分享链接和二维码纳入同一套备份与失败回滚流程。TUIC 保持单端口。
 
 `0.6.1` 修复端口跳跃成功后范围提示显示为空的问题，并明确 Desktop JSON 版本提示不影响 V2rayN 分享链接；不改变已保存的端口范围或运行规则。
+
+`0.7.0` 新增 Mihomo/Nikki YAML：按主力、备用、Argo 应急分层，支持 Hysteria2 多端口、TUIC、AnyTLS 和 Reality；VMess 只输出 Argo 应急入口。使用三个可见策略组、官方 MRS 规则、Fake-IP DNS、稳定随机认证和原子输出。
 
 脚本修改配置前会执行校验并创建备份，默认保留最近 20 份：
 
