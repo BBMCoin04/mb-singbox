@@ -1,6 +1,6 @@
 # MB sing-box 管理器
 
-MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.7.0`。
+MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.7.1`。
 
 命名约定：`MB` 只作为项目系列前缀，不另行展开；用户界面统一使用“MB sing-box 管理器”，技术标识统一使用 `mb-singbox`，上游内核统一写作 `sing-box`。主命令是 `mb-singbox`；旧命令 `singbox` 仅作为兼容别名保留。
 
@@ -189,7 +189,7 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 
 ## 更新与备份
 
-从旧版本更新到 `0.7.0` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。现有 Hysteria2 节点迁移后保持单端口，不会自动开启端口跳跃。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
+从旧版本更新到 `0.7.1` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。现有 Hysteria2 节点迁移后保持单端口，不会自动开启端口跳跃。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
 
 `0.5.2` 起，重新生成配置时会先备份现有客户端、链接和二维码目录，只生成 `sing-box-desktop.json`。旧的 `sing-box-router.json` 会随客户端目录替换而移除；`all.txt`、每个节点的单独链接和二维码继续生成。
 
@@ -204,6 +204,8 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 `0.6.1` 修复端口跳跃成功后范围提示显示为空的问题，并明确 Desktop JSON 版本提示不影响 V2rayN 分享链接；不改变已保存的端口范围或运行规则。
 
 `0.7.0` 新增 Mihomo/Nikki YAML：按主力、备用、Argo 应急分层，支持 Hysteria2 多端口、TUIC、AnyTLS 和 Reality；VMess 只输出 Argo 应急入口。使用三个可见策略组、官方 MRS 规则、Fake-IP DNS、稳定随机认证和原子输出。
+
+`0.7.1` 优化“重新生成并应用全部配置”：服务端内容未变化时只刷新客户端 JSON/YAML，不再重启 sing-box 或端口跳跃服务，避免代理链路中的 SSH 会话短暂掉线。
 
 脚本修改配置前会执行校验并创建备份，默认保留最近 20 份：
 

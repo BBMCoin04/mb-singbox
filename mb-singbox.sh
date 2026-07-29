@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.7.0"
+VERSION="0.7.1"
 PROGRAM="mb-singbox"
 MANAGER_UPDATE_APPLIED=0
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
@@ -3781,18 +3781,56 @@ system_tools_menu() {
 }
 
 regenerate_all_configs() {
-  local candidate
+  local candidate candidate_config candidate_hopping runtime_unchanged=0
   require_core || return 1
   init_state || return 1
   acquire_lock || return 1
-  candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  cp -a "$STATE_FILE" "$candidate"
-  if apply_candidate_state "$candidate"; then
-    rm -f "$candidate"
-    sync_firewall_if_managed
-    ok "服务端、Desktop JSON 和 Mihomo/Nikki YAML 已重新生成并应用。"
+  validate_state_certificates "$STATE_FILE" || return 1
+  check_port_hopping_rules "$STATE_FILE" || return 1
+
+  candidate_config="$(mktemp "${ROOT_DIR}/.server-check.XXXXXX.json")" || return 1
+  candidate_hopping="$(mktemp "${ROOT_DIR}/.hopping-check.XXXXXX.nft")" || { rm -f -- "$candidate_config"; return 1; }
+  if ! render_server_config "$STATE_FILE" "$candidate_config" ||
+     ! "$SINGBOX_BIN" check -c "$candidate_config"; then
+    rm -f -- "$candidate_config" "$candidate_hopping"
+    error "重新生成的服务端配置未通过检查。"
+    return 1
+  fi
+  if port_hopping_enabled_in_state "$STATE_FILE"; then
+    if ! render_port_hopping_nft "$STATE_FILE" "$candidate_hopping"; then
+      rm -f -- "$candidate_config" "$candidate_hopping"
+      return 1
+    fi
   else
-    rm -f "$candidate"
+    : > "$candidate_hopping"
+  fi
+
+  if [[ -s "$SERVER_CONFIG" ]] && cmp -s "$candidate_config" "$SERVER_CONFIG"; then
+    if port_hopping_enabled_in_state "$STATE_FILE"; then
+      cmp -s "$candidate_hopping" "$PORT_HOPPING_NFT_FILE" && runtime_unchanged=1
+    elif [[ ! -e "$PORT_HOPPING_NFT_FILE" ]]; then
+      runtime_unchanged=1
+    fi
+  fi
+  rm -f -- "$candidate_config" "$candidate_hopping"
+
+  if (( runtime_unchanged )); then
+    if generate_outputs "$STATE_FILE"; then
+      ok "客户端 JSON/YAML 已刷新；服务端配置未变化，未重启任何服务。"
+      return 0
+    fi
+    error "客户端配置重新生成失败，原输出保持不变。"
+    return 1
+  fi
+
+  candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
+  cp -a "$STATE_FILE" "$candidate" || { rm -f -- "$candidate"; return 1; }
+  if apply_candidate_state "$candidate"; then
+    rm -f -- "$candidate"
+    sync_firewall_if_managed
+    ok "服务端配置发生变化，已重新生成并应用全部配置。"
+  else
+    rm -f -- "$candidate"
     return 1
   fi
 }
