@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.7.1"
+VERSION="0.7.2"
 PROGRAM="mb-singbox"
 MANAGER_UPDATE_APPLIED=0
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
@@ -23,6 +23,7 @@ LINK_DIR="${MB_SINGBOX_LINK_DIR:-${ROOT_DIR}/links}"
 QR_DIR="${MB_SINGBOX_QR_DIR:-${ROOT_DIR}/qrcodes}"
 BACKUP_DIR="${MB_SINGBOX_BACKUP_DIR:-${ROOT_DIR}/backups}"
 LOG_DIR="${MB_SINGBOX_LOG_DIR:-/var/log/mb-singbox}"
+ACME_CERT_ROOT="${MB_SINGBOX_ACME_CERT_ROOT:-/etc/acme/certs}"
 SINGBOX_HOME="${MB_SINGBOX_CORE_DIR:-/usr/local/lib/mb-singbox}"
 SINGBOX_BIN="${MB_SINGBOX_BIN:-${SINGBOX_HOME}/sing-box}"
 SERVICE_FILE="${MB_SINGBOX_SERVICE_FILE:-/etc/systemd/system/mb-singbox.service}"
@@ -181,6 +182,16 @@ atomic_install_file() {
   fi
 }
 
+write_jq_candidate() {
+  local target="$1"
+  shift
+  if ! jq "$@" > "$target" || [[ ! -s "$target" ]]; then
+    rm -f -- "$target"
+    error "生成候选状态失败，原配置未修改。"
+    return 1
+  fi
+}
+
 acquire_lock() {
   ensure_directories
   exec 9>"$LOCK_FILE"
@@ -220,10 +231,40 @@ validate_ipv4() {
   done
 }
 
+count_ipv6_groups() {
+  local side="$1" group
+  local -a groups=()
+  [[ -n "$side" ]] || { printf '0'; return 0; }
+  IFS=':' read -r -a groups <<< "$side"
+  (( ${#groups[@]} > 0 )) || return 1
+  for group in "${groups[@]}"; do
+    [[ "$group" =~ ^[0-9a-f]{1,4}$ ]] || return 1
+  done
+  printf '%d' "${#groups[@]}"
+}
+
 validate_ipv6() {
-  local value="$1"
+  local value="${1,,}" left right left_count right_count group_count ipv4_tail
   [[ "$value" == *:* && "$value" != *'%'* ]] || return 1
-  getent ahostsv6 "$value" >/dev/null 2>&1
+  if [[ "$value" == *.* ]]; then
+    ipv4_tail="${value##*:}"
+    validate_ipv4 "$ipv4_tail" || return 1
+    value="${value%:*}:0:0"
+  fi
+  [[ "$value" =~ ^[0-9a-f:]+$ && "$value" != *:::* ]] || return 1
+
+  if [[ "$value" == *::* ]]; then
+    [[ "${value#*::}" != *::* ]] || return 1
+    left="${value%%::*}"
+    right="${value#*::}"
+    left_count="$(count_ipv6_groups "$left")" || return 1
+    right_count="$(count_ipv6_groups "$right")" || return 1
+    (( left_count + right_count < 8 ))
+  else
+    [[ "$value" != :* && "$value" != *: ]] || return 1
+    group_count="$(count_ipv6_groups "$value")" || return 1
+    (( group_count == 8 ))
+  fi
 }
 
 validate_host() {
@@ -484,7 +525,7 @@ init_state() {
 
 install_dependencies() {
   local missing=() command_name package_manager=""
-  for command_name in curl jq openssl tar flock ss getent; do
+  for command_name in curl jq openssl tar flock ss; do
     command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
   done
   (( ${#missing[@]} == 0 )) || warn "缺少必要命令：${missing[*]}，准备安装依赖。"
@@ -500,7 +541,7 @@ install_dependencies() {
       package_manager=yum
       yum install -y ca-certificates curl jq openssl tar util-linux iproute glibc-common
     else
-      error "无法识别受支持的包管理器，请手动安装：curl jq openssl tar util-linux iproute2 getent"
+      error "无法识别受支持的包管理器，请手动安装：curl jq openssl tar util-linux iproute2"
       return 1
     fi || return 1
   elif command -v apt-get >/dev/null 2>&1; then
@@ -511,7 +552,7 @@ install_dependencies() {
     package_manager=yum
   fi
 
-  for command_name in curl jq openssl tar flock ss getent; do
+  for command_name in curl jq openssl tar flock ss; do
     command -v "$command_name" >/dev/null 2>&1 || {
       error "安装依赖后仍缺少命令：${command_name}"
       return 1
@@ -623,20 +664,31 @@ port_hopping_enabled_in_state() {
   jq -e 'any(.nodes[]; .type == "hysteria2" and (.port_hopping.enabled // false))' "$1" >/dev/null 2>&1
 }
 
+warn_if_legacy_iptables() {
+  local version
+  command -v iptables >/dev/null 2>&1 || return 0
+  version="$(iptables --version 2>/dev/null || true)"
+  if [[ "$version" == *legacy* ]]; then
+    warn "检测到 iptables-legacy；Hysteria2 端口跳跃使用 nftables NAT，请启用后检查计数器和实际 UDP 连通性。"
+  fi
+}
+
 ensure_nft_available() {
-  command -v nft >/dev/null 2>&1 && return 0
-  info "端口跳跃需要 nftables，正在安装 nftables。"
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y nftables
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y nftables
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y nftables
-  else
-    error "无法自动安装 nftables，请先安装 nft 命令。"
-    return 1
-  fi || return 1
+  if ! command -v nft >/dev/null 2>&1; then
+    info "端口跳跃需要 nftables，正在安装 nftables。"
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y nftables
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y nftables
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y nftables
+    else
+      error "无法自动安装 nftables，请先安装 nft 命令。"
+      return 1
+    fi || return 1
+  fi
   command -v nft >/dev/null 2>&1 || { error "安装后仍找不到 nft 命令。"; return 1; }
+  warn_if_legacy_iptables
 }
 
 render_port_hopping_nft() {
@@ -647,7 +699,7 @@ render_port_hopping_nft() {
     printf '  chain prerouting {\n'
     printf '    type nat hook prerouting priority dstnat; policy accept;\n'
     while IFS=$'\t' read -r id start end target; do
-      printf '    udp dport %s-%s redirect to :%s comment "mb-singbox %s"\n' "$start" "$end" "$target" "$id"
+      printf '    udp dport %s-%s counter redirect to :%s comment "mb-singbox %s"\n' "$start" "$end" "$target" "$id"
     done < <(jq -r '.nodes[] | select(.type == "hysteria2" and (.port_hopping.enabled // false)) | [.id,.port_hopping.start,.port_hopping.end,.port] | @tsv' "$state")
     printf '  }\n'
     printf '}\n'
@@ -2130,6 +2182,16 @@ pick_unused_tcp_port() {
   return 1
 }
 
+wait_for_tcp_listener() {
+  local pid="$1" port="$2" attempt
+  for (( attempt = 0; attempt < 50; attempt++ )); do
+    kill -0 "$pid" 2>/dev/null || return 1
+    port_listening "$port" tcp && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 reality_target_compatible() (
   local node_json="$1" target server_port socks_port temp_dir test_node outbound
   local server_pid="" client_pid="" rc=1
@@ -2166,12 +2228,10 @@ reality_target_compatible() (
   "$SINGBOX_BIN" check -c "$temp_dir/client.json" >/dev/null || return 1
   "$SINGBOX_BIN" run -c "$temp_dir/server.json" > "$temp_dir/server.log" 2>&1 &
   server_pid=$!
-  sleep 0.5
-  kill -0 "$server_pid" 2>/dev/null || return 1
+  wait_for_tcp_listener "$server_pid" "$server_port" || return 1
   "$SINGBOX_BIN" run -c "$temp_dir/client.json" > "$temp_dir/client.log" 2>&1 &
   client_pid=$!
-  sleep 0.5
-  kill -0 "$client_pid" 2>/dev/null || return 1
+  wait_for_tcp_listener "$client_pid" "$socks_port" || return 1
 
   if curl --socks5-hostname "127.0.0.1:${socks_port}" --connect-timeout 5 --max-time 10 \
     -sSI "https://${target}/" >/dev/null 2> "$temp_dir/curl.log"; then
@@ -2273,28 +2333,35 @@ select_certificate() {
   local -a domains=()
   local cert domain index choice manual
   shopt -s nullglob
-  for cert in /etc/acme/certs/*/fullchain.pem; do
+  for cert in "$ACME_CERT_ROOT"/*/fullchain.pem; do
     domain="$(basename "$(dirname "$cert")")"
-    [[ -s "$cert" && -s "/etc/acme/certs/${domain}/key.pem" ]] && domains+=("$domain")
+    [[ -s "$cert" && -s "${ACME_CERT_ROOT}/${domain}/key.pem" ]] && domains+=("$domain")
   done
   shopt -u nullglob
 
   printf '\nTLS 证书：\n'
   if (( ${#domains[@]} > 0 )); then
-    for index in "${!domains[@]}"; do
-      printf '  %d. %s\n' "$((index + 1))" "${domains[$index]}"
-    done
-    printf '  m. 手动输入证书路径\n'
-    read -r -p "请选择：" choice
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#domains[@]} )); then
-      CERT_DOMAIN="${domains[$((choice - 1))]}"
-      CERT_FILE="/etc/acme/certs/${CERT_DOMAIN}/fullchain.pem"
-      KEY_FILE="/etc/acme/certs/${CERT_DOMAIN}/key.pem"
-    elif [[ "$choice" == "m" || "$choice" == "M" ]]; then
-      manual=1
+    if (( ${#domains[@]} == 1 )); then
+      CERT_DOMAIN="${domains[0]}"
+      CERT_FILE="${ACME_CERT_ROOT}/${CERT_DOMAIN}/fullchain.pem"
+      KEY_FILE="${ACME_CERT_ROOT}/${CERT_DOMAIN}/key.pem"
+      info "自动选择唯一的 MB-ACME 证书：${CERT_DOMAIN}"
     else
-      error "无效选项。"
-      return 1
+      for index in "${!domains[@]}"; do
+        printf '  %d. %s\n' "$((index + 1))" "${domains[$index]}"
+      done
+      printf '  m. 手动输入证书路径\n'
+      read -r -p "请选择：" choice
+      if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#domains[@]} )); then
+        CERT_DOMAIN="${domains[$((choice - 1))]}"
+        CERT_FILE="${ACME_CERT_ROOT}/${CERT_DOMAIN}/fullchain.pem"
+        KEY_FILE="${ACME_CERT_ROOT}/${CERT_DOMAIN}/key.pem"
+      elif [[ "$choice" == "m" || "$choice" == "M" ]]; then
+        manual=1
+      else
+        error "无效选项。"
+        return 1
+      fi
     fi
   else
     warn "没有发现 MB-ACME 已部署证书。"
@@ -2348,7 +2415,7 @@ add_reality_node() {
   }
   ok "Reality 握手目标已通过端到端校验。"
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  jq --argjson node "$node" '.nodes += [$node]' "$STATE_FILE" > "$candidate"
+  write_jq_candidate "$candidate" --argjson node "$node" '.nodes += [$node]' "$STATE_FILE" || return 1
   if apply_candidate_state "$candidate"; then
     rm -f "$candidate"
     sync_firewall_if_managed
@@ -2391,7 +2458,7 @@ add_tls_node() {
       ;;
   esac
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  jq --argjson node "$node" '.nodes += [$node]' "$STATE_FILE" > "$candidate"
+  write_jq_candidate "$candidate" --argjson node "$node" '.nodes += [$node]' "$STATE_FILE" || return 1
   if apply_candidate_state "$candidate"; then
     rm -f "$candidate"
     sync_firewall_if_managed
@@ -2560,7 +2627,7 @@ apply_node_field_update() {
   shift 2
   local candidate
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  jq --arg id "$id" "$@" "(.nodes[] | select(.id == \$id)) |= (${filter})" "$STATE_FILE" > "$candidate"
+  write_jq_candidate "$candidate" --arg id "$id" "$@" "(.nodes[] | select(.id == \$id)) |= (${filter})" "$STATE_FILE" || return 1
   if apply_candidate_state "$candidate"; then
     rm -f "$candidate"
     sync_firewall_if_managed
@@ -3208,7 +3275,10 @@ configure_argo() {
   esac
   origin="$(random_local_port)" || { rm -f -- "$ARGO_TOKEN_FILE"; error "无法分配 Argo 本地端口。"; return 1; }
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || { rm -f -- "$ARGO_TOKEN_FILE"; return 1; }
-  jq --arg mode "$mode" --arg id "$id" --arg hostname "$hostname" --argjson origin "$origin" '.argo={enabled:true,mode:$mode,node_id:$id,hostname:$hostname,origin_port:$origin,provisioned:false,verified:false,tunnel_id:"",public_port:2096}' "$STATE_FILE" > "$candidate"
+  if ! write_jq_candidate "$candidate" --arg mode "$mode" --arg id "$id" --arg hostname "$hostname" --argjson origin "$origin" '.argo={enabled:true,mode:$mode,node_id:$id,hostname:$hostname,origin_port:$origin,provisioned:false,verified:false,tunnel_id:"",public_port:2096}' "$STATE_FILE"; then
+    rm -f -- "$ARGO_TOKEN_FILE"
+    return 1
+  fi
   if ! apply_candidate_state "$candidate"; then
     rm -f "$candidate" "$ARGO_TOKEN_FILE"
     return 1
@@ -3240,7 +3310,7 @@ configure_argo() {
       return 0
     }
     candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-    jq --arg hostname "$hostname" '.argo.hostname=$hostname | .argo.provisioned=true' "$STATE_FILE" > "$candidate"
+    write_jq_candidate "$candidate" --arg hostname "$hostname" '.argo.hostname=$hostname | .argo.provisioned=true' "$STATE_FILE" || return 1
     if ! save_client_settings "$candidate" "Quick Tunnel 域名已保存。"; then
       rm -f -- "$candidate"
       return 1
@@ -3283,7 +3353,7 @@ refresh_quick_argo() {
   jq -e '.argo.enabled and .argo.mode=="quick"' "$STATE_FILE" >/dev/null || { error "当前未启用 Quick Tunnel。"; return 1; }
   hostname="$(wait_quick_hostname)" || { error "仍未从 cloudflared 日志取得随机域名。"; return 1; }
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  jq --arg hostname "$hostname" '.argo.hostname=$hostname | .argo.provisioned=true | .argo.verified=false' "$STATE_FILE" > "$candidate"
+  write_jq_candidate "$candidate" --arg hostname "$hostname" '.argo.hostname=$hostname | .argo.provisioned=true | .argo.verified=false' "$STATE_FILE" || return 1
   if ! save_client_settings "$candidate" "Quick Tunnel 域名已更新：${hostname}"; then
     rm -f -- "$candidate"
     return 1
@@ -3299,7 +3369,7 @@ disable_argo() {
   warn "Cloudflare 账户中的 Named Tunnel 不会被删除。"
   confirm "确定停用 Argo？" || return 0
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-  jq '.argo={enabled:false,mode:"",node_id:"",hostname:"",origin_port:0,provisioned:false,verified:false,tunnel_id:"",public_port:2096}' "$STATE_FILE" > "$candidate"
+  write_jq_candidate "$candidate" '.argo={enabled:false,mode:"",node_id:"",hostname:"",origin_port:0,provisioned:false,verified:false,tunnel_id:"",public_port:2096}' "$STATE_FILE" || return 1
   if apply_candidate_state "$candidate"; then
     rm -f -- "$candidate"
     stop_argo_service
@@ -3682,9 +3752,13 @@ client_settings_menu() {
     case "$choice" in
       1)
         candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-        jq '.client.preferred_enabled = ((.client.preferred_enabled != false) | not)' "$STATE_FILE" > "$candidate"
-        save_client_settings "$candidate"
-        rm -f "$candidate"
+        if ! write_jq_candidate "$candidate" '.client.preferred_enabled = ((.client.preferred_enabled != false) | not)' "$STATE_FILE" ||
+           ! save_client_settings "$candidate"; then
+          rm -f -- "$candidate"
+          pause
+          continue
+        fi
+        rm -f -- "$candidate"
         pause
         ;;
       2)
@@ -3707,16 +3781,24 @@ client_settings_menu() {
         fi
         addresses="$(jq -cn --args '$ARGS.positional' "${valid_addresses[@]}")"
         candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-        jq --argjson addresses "$addresses" '.client.preferred_addresses=$addresses | .client.preferred_results={} | .client.preferred_last_probe_at=""' "$STATE_FILE" > "$candidate"
-        save_client_settings "$candidate"
-        rm -f "$candidate"
+        if ! write_jq_candidate "$candidate" --argjson addresses "$addresses" '.client.preferred_addresses=$addresses | .client.preferred_results={} | .client.preferred_last_probe_at=""' "$STATE_FILE" ||
+           ! save_client_settings "$candidate"; then
+          rm -f -- "$candidate"
+          pause
+          continue
+        fi
+        rm -f -- "$candidate"
         pause
         ;;
       3)
         candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-        jq '.client.preferred_addresses=["cfip.1323123.xyz","cf.877771.xyz","cloudflare.182682.xyz","www.cloudflare.com","one.one.one.one"] | .client.preferred_results={} | .client.preferred_last_probe_at=""' "$STATE_FILE" > "$candidate"
-        save_client_settings "$candidate"
-        rm -f "$candidate"
+        if ! write_jq_candidate "$candidate" '.client.preferred_addresses=["cfip.1323123.xyz","cf.877771.xyz","cloudflare.182682.xyz","www.cloudflare.com","one.one.one.one"] | .client.preferred_results={} | .client.preferred_last_probe_at=""' "$STATE_FILE" ||
+           ! save_client_settings "$candidate"; then
+          rm -f -- "$candidate"
+          pause
+          continue
+        fi
+        rm -f -- "$candidate"
         pause
         ;;
       4)

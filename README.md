@@ -1,6 +1,6 @@
 # MB sing-box 管理器
 
-MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.7.1`。
+MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理脚本。当前管理器版本：`0.7.2`。
 
 命名约定：`MB` 只作为项目系列前缀，不另行展开；用户界面统一使用“MB sing-box 管理器”，技术标识统一使用 `mb-singbox`，上游内核统一写作 `sing-box`。主命令是 `mb-singbox`；旧命令 `singbox` 仅作为兼容别名保留。
 
@@ -21,6 +21,8 @@ MB sing-box 管理器是一个面向 systemd Linux VPS 的 sing-box 节点管理
 - Desktop 客户端配置要求 sing-box `1.14.0` 或更高版本
 - 创建 Hysteria2、TUIC、AnyTLS、VMess 前，需要准备受系统信任的 TLS 证书
 - 证书建议放在 `/etc/acme/certs/<域名>/`，不要放在 `/root` 或 `/home`
+
+推荐先用 MB-ACME 申请并部署证书，再安装 MB sing-box。ACME 签发后的 reload 服务名留空即可；sing-box 会监视 `certificate_path` 和 `key_path`，证书文件更新后自动加载新证书，不需要 HUP、reload 或 restart。创建 TLS 节点时，脚本会扫描 `/etc/acme/certs/*/fullchain.pem`：只有一张证书时自动选中，多张证书时才要求选择。
 
 Reality 不需要证书。新建 Reality 节点的默认握手域名是 `apple.com`，创建时仍会执行临时端到端兼容性校验，也可以手动输入其他域名。升级不会修改现有 Reality 节点的握手域名和客户端配置。
 
@@ -86,7 +88,7 @@ Hysteria2 创建时仍使用单端口。需要时进入菜单 `4 -> 选择 Hyste
 - VPS 上的输出会自动刷新，但已导入客户端的配置不会自动变化；每次调整后需要重新导入或下载配置
 - V2rayN 建议为 Hysteria2 选择 sing-box 内核；部分 Xray 版本使用 `mport` 时可能无法联网
 
-首次开启时如果缺少 `nft`，脚本会安装 nftables，但不会主动启用或覆盖系统的全局 nftables 配置。脚本只维护 `table inet mb_singbox_port_hopping`，停止主服务、关闭端口跳跃、删除节点和卸载时都会清理对应规则。
+首次开启时如果缺少 `nft`，脚本会安装 nftables，但不会主动启用或覆盖系统的全局 nftables 配置。脚本只维护 `table inet mb_singbox_port_hopping`，停止主服务、关闭端口跳跃、删除节点和卸载时都会清理对应规则。转发规则带有 `counter` 便于排障；检测到 `iptables-legacy` 时会提醒实际验证 UDP 连通性。
 
 云厂商安全组无法由脚本修改。开启后必须在云控制台放行菜单显示的完整 UDP 范围；服务端原始 `443/UDP` 入口仍会保留，旧的单端口客户端可继续使用，但刷新后的端口跳跃配置必须能够访问完整范围。
 
@@ -189,7 +191,7 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 
 ## 更新与备份
 
-从旧版本更新到 `0.7.1` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。现有 Hysteria2 节点迁移后保持单端口，不会自动开启端口跳跃。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
+从旧版本更新到 `0.7.2` 会保留节点、UUID、密码、Reality 密钥、现有 Reality 握手域名、证书路径、Argo 配置和原有 `singbox` 兼容命令。现有 Hysteria2 节点迁移后保持单端口，不会自动开启端口跳跃。首次打开菜单时会原子迁移主服务和 Argo 服务的 systemd 描述，只执行 `daemon-reload`，不会重启运行中的服务。
 
 `0.5.2` 起，重新生成配置时会先备份现有客户端、链接和二维码目录，只生成 `sing-box-desktop.json`。旧的 `sing-box-router.json` 会随客户端目录替换而移除；`all.txt`、每个节点的单独链接和二维码继续生成。
 
@@ -206,6 +208,8 @@ Token 只在当前配置过程中使用，不写入状态或日志。停用或�
 `0.7.0` 新增 Mihomo/Nikki YAML：按主力、备用、Argo 应急分层，支持 Hysteria2 多端口、TUIC、AnyTLS 和 Reality；VMess 只输出 Argo 应急入口。使用三个可见策略组、官方 MRS 规则、Fake-IP DNS、稳定随机认证和原子输出。
 
 `0.7.1` 优化“重新生成并应用全部配置”：服务端内容未变化时只刷新客户端 JSON/YAML，不再重启 sing-box 或端口跳跃服务，避免代理链路中的 SSH 会话短暂掉线。
+
+`0.7.2` 改为纯文本 IPv6 校验；Reality 临时服务改为最多等待 5 秒的端口就绪轮询；候选状态生成失败时保留原配置并直接报告；单张 MB-ACME 证书自动选中；端口跳跃增加 nftables 计数器和 iptables-legacy 告警。证书续期依赖 sing-box 对证书文件的自动热加载，不配置额外 ACME reload。
 
 脚本修改配置前会执行校验并创建备份，默认保留最近 20 份：
 
