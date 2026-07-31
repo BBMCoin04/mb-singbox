@@ -239,7 +239,7 @@ trim() {
 }
 
 validate_port() {
-  [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+  [[ "$1" =~ ^[1-9][0-9]*$ ]] && (( 10#$1 <= 65535 ))
 }
 
 validate_domain() {
@@ -311,10 +311,12 @@ validate_websocket_path() {
 }
 
 safe_id() {
-  local value
+  local value suffix
   value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' | cut -c1-24)"
   [[ -n "$value" ]] || value="node"
-  printf '%s-%s' "$value" "$(openssl rand -hex 3)"
+  suffix="$(openssl rand -hex 3)" || return 1
+  [[ "$suffix" =~ ^[a-f0-9]{6}$ ]] || return 1
+  printf '%s-%s' "$value" "$suffix"
 }
 
 new_uuid() {
@@ -654,8 +656,11 @@ latest_stable_version() {
 }
 
 current_core_version() {
+  local version
   [[ -x "$SINGBOX_BIN" ]] || return 1
-  "$SINGBOX_BIN" version 2>/dev/null | awk '/sing-box version/ {print $3; exit}'
+  version="$("$SINGBOX_BIN" version 2>/dev/null | awk '/sing-box version/ {print $3; exit}')" || return 1
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  printf '%s\n' "$version"
 }
 
 version_at_least() {
@@ -1443,7 +1448,11 @@ render_mihomo_config() {
   mapfile -t main_names < <(jq -r '.[] | select(._tier == "main") | .name' "$proxies_file")
   mapfile -t backup_names < <(jq -r '.[] | select(._tier == "backup") | .name' "$proxies_file")
   mapfile -t emergency_names < <(jq -r '.[] | select(._tier == "emergency") | .name' "$proxies_file")
-  mapfile -t all_names < <(jq -r '.[] | select(._tier == "main"), select(._tier == "backup"), select(._tier == "emergency") | .name' "$proxies_file")
+  mapfile -t all_names < <(jq -r '
+    ([.[] | select(._tier == "main")] +
+     [.[] | select(._tier == "backup")] +
+     [.[] | select(._tier == "emergency")])[] | .name
+  ' "$proxies_file")
 
   (( ${#main_names[@]} == 0 )) || tier_groups+=("主力测速")
   (( ${#backup_names[@]} == 0 )) || tier_groups+=("备用测速")
@@ -2582,8 +2591,8 @@ select_certificate() {
       done
       printf '  m. 手动输入证书路径\n'
       read -r -p "请选择：" choice
-      if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#domains[@]} )); then
-        CERT_DOMAIN="${domains[$((choice - 1))]}"
+      if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && (( 10#$choice <= ${#domains[@]} )); then
+        CERT_DOMAIN="${domains[$((10#$choice - 1))]}"
         CERT_FILE="${ACME_CERT_ROOT}/${CERT_DOMAIN}/fullchain.pem"
         KEY_FILE="${ACME_CERT_ROOT}/${CERT_DOMAIN}/key.pem"
       elif [[ "$choice" == "m" || "$choice" == "M" ]]; then
@@ -2625,7 +2634,7 @@ read_node_name() {
 add_reality_node() {
   local name id port uuid target keys private_key public_key short_id node candidate
   name="$(read_node_name "Reality")" || return 1
-  id="$(safe_id "$name")"
+  id="$(safe_id "$name")" || return 1
   port="$(choose_port tcp 443)" || return 1
   read -r -p "Reality 握手域名 [${DEFAULT_REALITY_TARGET}]：" target
   target="${target:-$DEFAULT_REALITY_TARGET}"
@@ -2666,7 +2675,7 @@ add_tls_node() {
     *) return 1 ;;
   esac
   name="$(read_node_name "$default_name")" || return 1
-  id="$(safe_id "$name")"
+  id="$(safe_id "$name")" || return 1
   port="$(choose_port "$network" "$default_port")" || return 1
   select_certificate || return 1
   password="$(random_password)"
@@ -2803,8 +2812,8 @@ select_node_id() {
   while true; do
     read -r -p "${prompt}（输入 0 返回）：" choice
     [[ "$choice" == "0" ]] && return 2
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )); then
-      jq -r --argjson index "$((choice - 1))" '.nodes[$index].id' "$STATE_FILE"
+    if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && (( 10#$choice <= count )); then
+      jq -r --argjson index "$((10#$choice - 1))" '.nodes[$index].id' "$STATE_FILE"
       return 0
     fi
     error "请选择 1 到 ${count}，或输入 0 返回。"
@@ -3547,11 +3556,11 @@ configure_argo() {
     printf '  %d. %s (%s)\n' "$((index + 1))" "$(jq -r --arg id "$id" '.nodes[]|select(.id==$id)|.name' "$STATE_FILE")" "$id"
   done
   read -r -p "请选择：" choice
-  if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#vmess_ids[@]} )); then
+  if [[ ! "$choice" =~ ^[1-9][0-9]*$ ]] || (( 10#$choice > ${#vmess_ids[@]} )); then
     error "无效选项。"
     return 1
   fi
-  id="${vmess_ids[$((choice - 1))]}"
+  id="${vmess_ids[$((10#$choice - 1))]}"
   printf '\nArgo 模式：\n  1. Named Tunnel（固定域名，长期备用）\n  2. Quick Tunnel（随机域名，临时救急）\n'
   read -r -p "请选择：" choice
   case "$choice" in
@@ -3772,8 +3781,13 @@ remove_managed_ufw_rules() {
 }
 
 desired_ufw_rules() {
-  local type port hop_start hop_end hop_enabled protocol
+  local type port hop_start hop_end hop_enabled protocol rows
+  rows="$(jq -r '.nodes[] | [.type,.port,(.port_hopping.start // 0),(.port_hopping.end // 0),(.port_hopping.enabled // false)] | @tsv' "$STATE_FILE")" || {
+    error "无法从状态文件生成 UFW 节点规则。"
+    return 1
+  }
   while IFS=$'\t' read -r type port hop_start hop_end hop_enabled; do
+    [[ -n "$type" ]] || continue
     case "$type" in
       hysteria2|tuic) protocol=udp ;;
       *) protocol=tcp ;;
@@ -3782,20 +3796,22 @@ desired_ufw_rules() {
     if [[ "$type" == "hysteria2" && "$hop_enabled" == "true" ]]; then
       printf 'udp\t%s:%s\tmb-singbox Hysteria2 hopping %s-%s\n' "$hop_start" "$hop_end" "$hop_start" "$hop_end"
     fi
-  done < <(jq -r '.nodes[] | [.type,.port,(.port_hopping.start // 0),(.port_hopping.end // 0),(.port_hopping.enabled // false)] | @tsv' "$STATE_FILE")
+  done <<< "$rows"
 }
 
 add_desired_ufw_rules() {
-  local protocol port comment
+  local protocol port comment rules
+  rules="$(desired_ufw_rules)" || return 1
   while IFS=$'\t' read -r protocol port comment; do
     [[ -z "$protocol" ]] || ufw allow "${port}/${protocol}" comment "$comment" >/dev/null || return 1
-  done < <(desired_ufw_rules)
+  done <<< "$rules"
 }
 
 remove_obsolete_ufw_rules() {
-  local line number rule wanted desired numbers=""
+  local line number rule wanted desired numbers="" rules
   local -a desired_rules=()
-  mapfile -t desired_rules < <(desired_ufw_rules | awk -F '\t' '{print $2 "/" $1}')
+  rules="$(desired_ufw_rules)" || return 1
+  mapfile -t desired_rules < <(printf '%s\n' "$rules" | awk -F '\t' 'NF >= 2 {print $2 "/" $1}')
   while IFS= read -r line; do
     [[ "$line" == *"# mb-singbox"* || "$line" == *"# MB-Singbox"* ]] || continue
     number="$(sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' <<<"$line")"
