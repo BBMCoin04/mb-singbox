@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.7.4"
+VERSION="0.7.5"
 PROGRAM="mb-singbox"
 MANAGER_UPDATE_APPLIED=0
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
