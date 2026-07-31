@@ -795,19 +795,27 @@ check_port_hopping_rules() {
 }
 
 check_installed_port_hopping_rules() {
-  local temporary
+  local temporary legacy_temporary
   if ! port_hopping_enabled_in_state "$STATE_FILE"; then
     return 0
   fi
   [[ -s "$PORT_HOPPING_NFT_FILE" ]] || { error "端口跳跃规则文件缺失：${PORT_HOPPING_NFT_FILE}"; return 1; }
   temporary="$(mktemp /tmp/mb-singbox-port-hopping-current.XXXXXX.nft)" || return 1
-  render_port_hopping_nft "$STATE_FILE" "$temporary" || { rm -f -- "$temporary"; return 1; }
-  if ! cmp -s "$temporary" "$PORT_HOPPING_NFT_FILE"; then
-    rm -f -- "$temporary"
-    error "已安装的端口跳跃规则与当前状态不一致，请运行 mb-singbox render。"
-    return 1
+  legacy_temporary="${temporary}.legacy"
+  render_port_hopping_nft "$STATE_FILE" "$temporary" || { rm -f -- "$temporary" "$legacy_temporary"; return 1; }
+  if cmp -s "$temporary" "$PORT_HOPPING_NFT_FILE"; then
+    rm -f -- "$temporary" "$legacy_temporary"
+    return 0
   fi
-  rm -f -- "$temporary"
+  if sed 's/ counter redirect/ redirect/' "$temporary" > "$legacy_temporary" &&
+     cmp -s "$legacy_temporary" "$PORT_HOPPING_NFT_FILE"; then
+    rm -f -- "$temporary" "$legacy_temporary"
+    warn "当前使用兼容的旧版端口跳跃规则（无计数器），转发不受影响；需要计数器时可在维护窗口运行 mb-singbox render。"
+    return 0
+  fi
+  rm -f -- "$temporary" "$legacy_temporary"
+  error "已安装的端口跳跃规则与当前状态不一致，请运行 mb-singbox render。"
+  return 1
 }
 
 clear_port_hopping_rules() {
