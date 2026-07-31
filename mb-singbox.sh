@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.7.2"
+VERSION="0.7.3"
 PROGRAM="mb-singbox"
 MANAGER_UPDATE_APPLIED=0
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
@@ -45,6 +45,7 @@ BBR_FILE="${MB_SINGBOX_BBR_FILE:-/etc/sysctl.d/99-mb-singbox-bbr.conf}"
 LOCK_FILE="${MB_SINGBOX_LOCK_FILE:-/run/lock/mb-singbox.lock}"
 BACKUP_KEEP="${MB_SINGBOX_BACKUP_KEEP:-20}"
 MANAGED_MARKER_NAME=".mb-singbox-managed"
+LOCK_HELD=0
 SELF_PATH="${BASH_SOURCE[0]}"
 if [[ -f "$SELF_PATH" ]]; then
   SELF_PATH="$(readlink -f "$SELF_PATH" 2>/dev/null || printf '%s' "$SELF_PATH")"
@@ -138,9 +139,12 @@ validate_managed_layout() {
   path_is_within "$QR_DIR" "$ROOT_DIR" || { error "二维码目录必须位于 ${ROOT_DIR} 内。"; return 1; }
   path_is_within "$BACKUP_DIR" "$ROOT_DIR" || { error "备份目录必须位于 ${ROOT_DIR} 内。"; return 1; }
   path_is_within "$PORT_HOPPING_NFT_FILE" "$ROOT_DIR" || { error "端口跳跃规则文件必须位于 ${ROOT_DIR} 内。"; return 1; }
-  [[ "$(basename "$INSTALL_PATH")" == "mb-singbox" ]] || { error "管理器安装文件名必须是 mb-singbox。"; return 1; }
-  [[ "$(basename "$QUICK_PATH")" == "mb-singbox" ]] || { error "主命令文件名必须是 mb-singbox。"; return 1; }
-  [[ "$(basename "$LEGACY_QUICK_PATH")" == "singbox" ]] || { error "兼容命令文件名必须是 singbox。"; return 1; }
+  [[ "$INSTALL_PATH" == /* && "$(basename "$INSTALL_PATH")" == "mb-singbox" ]] || { error "管理器安装路径必须是绝对路径，并以 mb-singbox 结尾。"; return 1; }
+  [[ "$QUICK_PATH" == /* && "$(basename "$QUICK_PATH")" == "mb-singbox" ]] || { error "主命令路径必须是绝对路径，并以 mb-singbox 结尾。"; return 1; }
+  [[ "$LEGACY_QUICK_PATH" == /* && "$(basename "$LEGACY_QUICK_PATH")" == "singbox" ]] || { error "兼容命令路径必须是绝对路径，并以 singbox 结尾。"; return 1; }
+  if [[ -e "$INSTALL_PATH" || -L "$INSTALL_PATH" ]]; then
+    [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] || { error "管理器安装目标必须是普通文件：${INSTALL_PATH}"; return 1; }
+  fi
   [[ "$BACKUP_KEEP" =~ ^[0-9]+$ ]] && (( BACKUP_KEEP >= 1 && BACKUP_KEEP <= 100 )) || {
     error "MB_SINGBOX_BACKUP_KEEP 必须是 1 到 100。"
     return 1
@@ -193,12 +197,38 @@ write_jq_candidate() {
 }
 
 acquire_lock() {
-  ensure_directories
+  (( LOCK_HELD == 0 )) || { error "管理器内部发生重复加锁。"; return 1; }
+  validate_managed_layout || return 1
+  install -d -m 0755 "$(dirname "$LOCK_FILE")" || return 1
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
+    exec 9>&-
     error "另一个 MB sing-box 管理器操作正在进行。"
     return 1
   fi
+  LOCK_HELD=1
+  if ! ensure_directories; then
+    flock -u 9 >/dev/null 2>&1 || true
+    exec 9>&-
+    LOCK_HELD=0
+    return 1
+  fi
+}
+
+release_lock() {
+  (( LOCK_HELD )) || return 0
+  flock -u 9 >/dev/null 2>&1 || true
+  exec 9>&-
+  LOCK_HELD=0
+}
+
+with_lock() {
+  local rc
+  acquire_lock || return 1
+  "$@"
+  rc=$?
+  release_lock
+  return "$rc"
 }
 
 trim() {
@@ -424,8 +454,35 @@ state_valid() {
   [[ -z "$address" ]] || validate_domain "$address"
 }
 
+state_consistent() {
+  local state="$1"
+  jq -e '
+    . as $root |
+    ((.firewall_mode == "managed") == .firewall_managed) and
+    (.argo.mode == "" or .argo.mode == "named" or .argo.mode == "quick") and
+    (if (.argo.verified // false) then (.argo.provisioned // false) else true end) and
+    (if .argo.enabled then
+      (.argo.mode == "named" or .argo.mode == "quick") and
+      .argo.origin_port > 0 and
+      any(.nodes[]; .id == $root.argo.node_id and .type == "vmess") and
+      (if .argo.mode == "named" then (.argo.hostname | length) > 0 else true end) and
+      all(.nodes[];
+        if .type == "reality" or .type == "anytls" or .type == "vmess" then
+          .port != $root.argo.origin_port
+        else true end)
+     else
+      .argo.mode == "" and .argo.origin_port == 0 and
+      (.argo.verified // false) == false
+     end)
+  ' "$state" >/dev/null 2>&1
+}
+
+state_candidate_valid() {
+  state_valid "$1" && state_consistent "$1"
+}
+
 init_state() {
-  local normalized mihomo_proxy_password="" mihomo_controller_secret=""
+  local normalized migration_backup="" mihomo_proxy_password="" mihomo_controller_secret=""
   ensure_directories || return 1
   if [[ -s "$STATE_FILE" ]]; then
     mihomo_proxy_password="$(jq -r '.client.mihomo.proxy_password // empty' "$STATE_FILE" 2>/dev/null || true)"
@@ -470,12 +527,24 @@ init_state() {
       error "状态迁移失败，原文件保持不变：${STATE_FILE}"
       return 1
     fi
-    if ! cmp -s "$STATE_FILE" "$normalized" && ! atomic_install_file "$normalized" "$STATE_FILE" 0600; then
-      rm -f -- "$normalized"
-      error "无法原子更新状态文件，原文件保持不变。"
-      return 1
+    if ! cmp -s "$STATE_FILE" "$normalized"; then
+      migration_backup="$(mktemp -d "${BACKUP_DIR}/state-before-0.7.3-$(date +%Y%m%d-%H%M%S).XXXXXX")" || {
+        rm -f -- "$normalized"
+        return 1
+      }
+      chmod 0700 "$migration_backup" || { rm -rf -- "$migration_backup"; rm -f -- "$normalized"; return 1; }
+      if ! cp -a -- "$STATE_FILE" "$migration_backup/state.json" ||
+         ! atomic_install_file "$normalized" "$STATE_FILE" 0600; then
+        rm -f -- "$normalized"
+        error "无法原子更新状态文件，原文件保持不变；迁移备份：${migration_backup}"
+        return 1
+      fi
+      ok "旧状态已原子迁移；迁移前备份：${migration_backup}"
     fi
     rm -f -- "$normalized"
+    if ! state_consistent "$STATE_FILE"; then
+      warn "现有状态存在跨字段不一致；本次未自动修改，请运行 doctor 检查。"
+    fi
     return 0
   fi
 
@@ -753,10 +822,9 @@ apply_port_hopping_rules() {
   fi
 }
 
-write_port_hopping_service_file() {
-  local temporary
-  temporary="$(mktemp /tmp/mb-singbox-port-hopping-service.XXXXXX)" || return 1
-  cat > "$temporary" <<EOF
+render_port_hopping_service_file() {
+  local output="$1"
+  cat > "$output" <<EOF
 [Unit]
 Description=${PORT_HOPPING_SERVICE_DESCRIPTION}
 Wants=network-online.target
@@ -786,11 +854,6 @@ AmbientCapabilities=CAP_NET_ADMIN
 [Install]
 WantedBy=multi-user.target
 EOF
-  if ! atomic_install_file "$temporary" "$PORT_HOPPING_SERVICE_FILE" 0644; then
-    rm -f -- "$temporary"
-    return 1
-  fi
-  rm -f -- "$temporary"
 }
 
 sync_port_hopping_runtime() {
@@ -819,13 +882,29 @@ install_port_hopping_file_for_state() {
   fi
 }
 
+restore_optional_file() {
+  local backup="$1" existed="$2" target="$3" mode="$4"
+  if (( existed )); then
+    atomic_install_file "$backup" "$target" "$mode"
+  else
+    rm -f -- "$target"
+  fi
+}
+
 write_service_file() {
-  local temporary hopping_dependency=""
-  temporary="$(mktemp /tmp/mb-singbox-service.XXXXXX)" || return 1
+  local main_candidate hopping_candidate main_backup hopping_backup hopping_dependency=""
+  local main_existed=0 hopping_existed=0 commit_started=0 rc=0
+  main_candidate="$(mktemp /tmp/mb-singbox-service.XXXXXX)" || return 1
+  hopping_candidate="$(mktemp /tmp/mb-singbox-port-hopping-service.XXXXXX)" || { rm -f -- "$main_candidate"; return 1; }
+  main_backup="$(mktemp /tmp/mb-singbox-service-backup.XXXXXX)" || { rm -f -- "$main_candidate" "$hopping_candidate"; return 1; }
+  hopping_backup="$(mktemp /tmp/mb-singbox-port-hopping-service-backup.XXXXXX)" || {
+    rm -f -- "$main_candidate" "$hopping_candidate" "$main_backup"
+    return 1
+  }
   if port_hopping_enabled_in_state "$STATE_FILE"; then
     hopping_dependency=$'Requires='"${PORT_HOPPING_SERVICE_NAME}"$'\nAfter='"${PORT_HOPPING_SERVICE_NAME}"
   fi
-  cat > "$temporary" <<EOF
+  cat > "$main_candidate" <<EOF
 [Unit]
 Description=${MAIN_SERVICE_DESCRIPTION}
 Wants=network-online.target
@@ -855,12 +934,30 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 [Install]
 WantedBy=multi-user.target
 EOF
-  if ! atomic_install_file "$temporary" "$SERVICE_FILE" 0644 || ! write_port_hopping_service_file; then
-    rm -f -- "$temporary"
-    return 1
+  render_port_hopping_service_file "$hopping_candidate" || rc=1
+  if (( rc == 0 )) && [[ -f "$SERVICE_FILE" ]]; then
+    if cp -a -- "$SERVICE_FILE" "$main_backup"; then main_existed=1; else rc=1; fi
   fi
-  rm -f -- "$temporary"
-  systemctl daemon-reload
+  if (( rc == 0 )) && [[ -f "$PORT_HOPPING_SERVICE_FILE" ]]; then
+    if cp -a -- "$PORT_HOPPING_SERVICE_FILE" "$hopping_backup"; then hopping_existed=1; else rc=1; fi
+  fi
+  if (( rc == 0 )); then
+    commit_started=1
+    atomic_install_file "$main_candidate" "$SERVICE_FILE" 0644 || rc=1
+  fi
+  if (( rc == 0 )); then
+    atomic_install_file "$hopping_candidate" "$PORT_HOPPING_SERVICE_FILE" 0644 || rc=1
+  fi
+  if (( rc == 0 )); then
+    systemctl daemon-reload || rc=1
+  fi
+  if (( rc != 0 && commit_started )); then
+    restore_optional_file "$main_backup" "$main_existed" "$SERVICE_FILE" 0644 || true
+    restore_optional_file "$hopping_backup" "$hopping_existed" "$PORT_HOPPING_SERVICE_FILE" 0644 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  rm -f -- "$main_candidate" "$hopping_candidate" "$main_backup" "$hopping_backup"
+  (( rc == 0 ))
 }
 
 unit_description() {
@@ -922,14 +1019,64 @@ restore_core_binary() {
   fi
 }
 
+CORE_TRANSACTION_BACKUP=""
+CORE_TRANSACTION_SERVICE_BACKUP=""
+CORE_TRANSACTION_HOPPING_BACKUP=""
+CORE_TRANSACTION_TEMP_ROOT=""
+CORE_TRANSACTION_SERVICE_EXISTED=0
+CORE_TRANSACTION_HOPPING_EXISTED=0
+CORE_TRANSACTION_SERVICE_ACTIVE=0
+
+clear_core_transaction() {
+  trap - HUP INT TERM
+  CORE_TRANSACTION_BACKUP=""
+  CORE_TRANSACTION_SERVICE_BACKUP=""
+  CORE_TRANSACTION_HOPPING_BACKUP=""
+  CORE_TRANSACTION_TEMP_ROOT=""
+  CORE_TRANSACTION_SERVICE_EXISTED=0
+  CORE_TRANSACTION_HOPPING_EXISTED=0
+  CORE_TRANSACTION_SERVICE_ACTIVE=0
+}
+
+interrupt_core_transaction() {
+  local code="$1"
+  trap - HUP INT TERM
+  restore_core_binary "$CORE_TRANSACTION_BACKUP" || true
+  restore_optional_file "$CORE_TRANSACTION_SERVICE_BACKUP" "$CORE_TRANSACTION_SERVICE_EXISTED" "$SERVICE_FILE" 0644 || true
+  restore_optional_file "$CORE_TRANSACTION_HOPPING_BACKUP" "$CORE_TRANSACTION_HOPPING_EXISTED" "$PORT_HOPPING_SERVICE_FILE" 0644 || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if (( CORE_TRANSACTION_SERVICE_ACTIVE )); then
+    systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+  else
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+  fi
+  rm -rf -- "$CORE_TRANSACTION_TEMP_ROOT"
+  rm -f -- "$CORE_TRANSACTION_BACKUP" "$CORE_TRANSACTION_SERVICE_BACKUP" "$CORE_TRANSACTION_HOPPING_BACKUP"
+  release_lock
+  exit "$code"
+}
+
+arm_core_transaction() {
+  CORE_TRANSACTION_BACKUP="$1"
+  CORE_TRANSACTION_SERVICE_BACKUP="$2"
+  CORE_TRANSACTION_HOPPING_BACKUP="$3"
+  CORE_TRANSACTION_TEMP_ROOT="$4"
+  CORE_TRANSACTION_SERVICE_EXISTED="$5"
+  CORE_TRANSACTION_HOPPING_EXISTED="$6"
+  CORE_TRANSACTION_SERVICE_ACTIVE="$7"
+  trap 'interrupt_core_transaction 129' HUP
+  trap 'interrupt_core_transaction 130' INT
+  trap 'interrupt_core_transaction 143' TERM
+}
+
 install_or_update_core() {
   local requested="${1:-}" current="" extracted version backup="" temp_root
-  local service_was_active=0
+  local service_backup="" hopping_service_backup=""
+  local service_was_active=0 service_file_existed=0 hopping_service_file_existed=0
   require_root
   require_systemd || return 1
   install_dependencies || return 1
   init_state || return 1
-  acquire_lock || return 1
 
   current="$(current_core_version 2>/dev/null || true)"
   systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && service_was_active=1
@@ -946,7 +1093,6 @@ install_or_update_core() {
     error "MB sing-box 管理器 ${VERSION} 最低支持 sing-box 1.13.0，拒绝安装 ${version}。"
     return 1
   fi
-
   if [[ -s "$SERVER_CONFIG" ]] && ! "$extracted" check -c "$SERVER_CONFIG"; then
     rm -rf -- "$temp_root"
     error "现有服务端配置未通过 sing-box ${version} 检查，不会更新内核。"
@@ -958,8 +1104,30 @@ install_or_update_core() {
     backup="$(mktemp "${SINGBOX_HOME}/.sing-box.previous.XXXXXX")" || { rm -rf -- "$temp_root"; return 1; }
     cp -a -- "$SINGBOX_BIN" "$backup" || { rm -f -- "$backup"; rm -rf -- "$temp_root"; return 1; }
   fi
+  service_backup="$(mktemp /tmp/mb-singbox-core-service-backup.XXXXXX)" || {
+    rm -f -- "$backup"; rm -rf -- "$temp_root"; return 1
+  }
+  hopping_service_backup="$(mktemp /tmp/mb-singbox-core-hopping-service-backup.XXXXXX)" || {
+    rm -f -- "$backup" "$service_backup"; rm -rf -- "$temp_root"; return 1
+  }
+  if [[ -f "$SERVICE_FILE" ]]; then
+    service_file_existed=1
+    cp -a -- "$SERVICE_FILE" "$service_backup" || {
+      rm -f -- "$backup" "$service_backup" "$hopping_service_backup"; rm -rf -- "$temp_root"; return 1
+    }
+  fi
+  if [[ -f "$PORT_HOPPING_SERVICE_FILE" ]]; then
+    hopping_service_file_existed=1
+    cp -a -- "$PORT_HOPPING_SERVICE_FILE" "$hopping_service_backup" || {
+      rm -f -- "$backup" "$service_backup" "$hopping_service_backup"; rm -rf -- "$temp_root"; return 1
+    }
+  fi
+  arm_core_transaction "$backup" "$service_backup" "$hopping_service_backup" "$temp_root" \
+    "$service_file_existed" "$hopping_service_file_existed" "$service_was_active"
+
   if ! atomic_install_file "$extracted" "$SINGBOX_BIN" 0755; then
-    rm -f -- "$backup"
+    clear_core_transaction
+    rm -f -- "$backup" "$service_backup" "$hopping_service_backup"
     rm -rf -- "$temp_root"
     error "无法原子安装 sing-box 内核。"
     return 1
@@ -967,23 +1135,29 @@ install_or_update_core() {
   rm -rf -- "$temp_root"
   if ! write_service_file; then
     restore_core_binary "$backup" || true
-    rm -f -- "$backup"
-    error "systemd 服务文件更新失败，已恢复旧内核。"
+    clear_core_transaction
+    rm -f -- "$backup" "$service_backup" "$hopping_service_backup"
+    error "systemd 服务文件更新失败，已恢复旧内核和旧服务文件。"
     return 1
   fi
 
   if [[ -s "$SERVER_CONFIG" && "$service_was_active" == "1" ]]; then
     if ! systemctl restart "$SERVICE_NAME" || ! systemctl is-active --quiet "$SERVICE_NAME"; then
       restore_core_binary "$backup" || true
+      restore_optional_file "$service_backup" "$service_file_existed" "$SERVICE_FILE" 0644 || true
+      restore_optional_file "$hopping_service_backup" "$hopping_service_file_existed" "$PORT_HOPPING_SERVICE_FILE" 0644 || true
+      systemctl daemon-reload >/dev/null 2>&1 || true
       systemctl restart "$SERVICE_NAME" || true
-      rm -f -- "$backup"
-      error "新内核启动失败，已恢复旧内核。"
+      clear_core_transaction
+      rm -f -- "$backup" "$service_backup" "$hopping_service_backup"
+      error "新内核启动失败，已恢复旧内核和旧服务文件。"
       return 1
     fi
   elif [[ -s "$SERVER_CONFIG" ]]; then
     info "服务更新前处于停止状态，本次不会自动启动。"
   fi
-  rm -f -- "$backup"
+  clear_core_transaction
+  rm -f -- "$backup" "$service_backup" "$hopping_service_backup"
   ok "sing-box ${version} 已安装到 ${SINGBOX_BIN}"
   [[ -n "$current" ]] && info "更新前版本：${current}"
 }
@@ -1785,14 +1959,11 @@ refresh_preferred_results() {
     fi
   fi
 
-  if ! state_valid "$candidate" || ! generate_outputs "$candidate" || ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
+  if ! save_client_settings "$candidate" "优选地址结果已保存；普通配置重建将复用本次结果。"; then
     rm -f -- "$candidate"
-    generate_outputs "$STATE_FILE" >/dev/null 2>&1 || true
-    error "优选结果保存失败，原状态保持不变。"
     return 1
   fi
   rm -f -- "$candidate"
-  ok "优选地址结果已保存；普通配置重建将复用本次结果。"
 }
 
 swap_generated_outputs() {
@@ -2036,12 +2207,63 @@ prune_backups() {
   done
 }
 
+APPLY_TRANSACTION_BACKUP=""
+APPLY_TRANSACTION_CANDIDATE=""
+APPLY_TRANSACTION_CONFIG=""
+APPLY_TRANSACTION_HOPPING=""
+APPLY_TRANSACTION_SERVICE_ACTIVE=0
+APPLY_TRANSACTION_SERVICE_ENABLED=0
+
+clear_apply_transaction() {
+  trap - HUP INT TERM
+  APPLY_TRANSACTION_BACKUP=""
+  APPLY_TRANSACTION_CANDIDATE=""
+  APPLY_TRANSACTION_CONFIG=""
+  APPLY_TRANSACTION_HOPPING=""
+  APPLY_TRANSACTION_SERVICE_ACTIVE=0
+  APPLY_TRANSACTION_SERVICE_ENABLED=0
+}
+
+interrupt_apply_transaction() {
+  local code="$1"
+  trap - HUP INT TERM
+  rm -f -- "$APPLY_TRANSACTION_CANDIDATE" "$APPLY_TRANSACTION_CONFIG" "$APPLY_TRANSACTION_HOPPING"
+  if [[ -n "$APPLY_TRANSACTION_BACKUP" && -d "$APPLY_TRANSACTION_BACKUP" ]]; then
+    restore_backup "$APPLY_TRANSACTION_BACKUP" || true
+    sync_port_hopping_runtime >/dev/null 2>&1 || true
+    if (( APPLY_TRANSACTION_SERVICE_ACTIVE )); then
+      systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+    else
+      systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+    if (( APPLY_TRANSACTION_SERVICE_ENABLED )); then
+      systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    else
+      systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+  fi
+  release_lock
+  exit "$code"
+}
+
+arm_apply_transaction() {
+  APPLY_TRANSACTION_BACKUP="$1"
+  APPLY_TRANSACTION_CANDIDATE="$2"
+  APPLY_TRANSACTION_CONFIG="$3"
+  APPLY_TRANSACTION_HOPPING="$4"
+  APPLY_TRANSACTION_SERVICE_ACTIVE="$5"
+  APPLY_TRANSACTION_SERVICE_ENABLED="$6"
+  trap 'interrupt_apply_transaction 129' HUP
+  trap 'interrupt_apply_transaction 130' INT
+  trap 'interrupt_apply_transaction 143' TERM
+}
+
 apply_candidate_state() {
   local candidate="$1" candidate_config candidate_hopping backup
   local service_was_active=0 service_was_enabled=0
   require_core || return 1
-  state_valid "$candidate" || {
-    error "候选状态格式不正确。"
+  state_candidate_valid "$candidate" || {
+    error "候选状态格式或跨字段一致性不正确。"
     return 1
   }
   validate_state_certificates "$candidate" || return 1
@@ -2063,21 +2285,24 @@ apply_candidate_state() {
     error "候选配置未通过 sing-box 检查，不会替换现有配置。"
     return 1
   fi
+  systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && service_was_active=1
+  systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null && service_was_enabled=1
   backup="$(backup_current)" || { rm -f -- "$candidate_config" "$candidate_hopping"; return 1; }
+  arm_apply_transaction "$backup" "$candidate" "$candidate_config" "$candidate_hopping" "$service_was_active" "$service_was_enabled"
   if ! generate_outputs "$candidate"; then
+    clear_apply_transaction
     rm -f -- "$candidate_config" "$candidate_hopping"
     rm -rf -- "$backup"
     error "客户端配置生成失败，不会替换现有状态。"
     return 1
   fi
-  systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && service_was_active=1
-  systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null && service_was_enabled=1
   if ! atomic_install_file "$candidate" "$STATE_FILE" 0600 ||
      ! atomic_install_file "$candidate_config" "$SERVER_CONFIG" 0600 ||
      ! install_port_hopping_file_for_state "$candidate" "$candidate_hopping"; then
     rm -f -- "$candidate_config" "$candidate_hopping"
     restore_backup "$backup" || warn "自动恢复不完整，请检查备份：${backup}"
     sync_port_hopping_runtime >/dev/null 2>&1 || true
+    clear_apply_transaction
     error "状态、服务端配置或端口跳跃规则替换失败，已恢复。"
     return 1
   fi
@@ -2085,12 +2310,14 @@ apply_candidate_state() {
   if ! write_service_file; then
     restore_backup "$backup" || warn "自动恢复不完整，请检查备份：${backup}"
     sync_port_hopping_runtime >/dev/null 2>&1 || true
+    clear_apply_transaction
     error "写入 systemd 服务失败，已恢复。"
     return 1
   fi
   if ! sync_port_hopping_runtime; then
     restore_backup "$backup" || warn "自动恢复不完整，请检查备份：${backup}"
     sync_port_hopping_runtime >/dev/null 2>&1 || true
+    clear_apply_transaction
     error "端口跳跃规则未能生效，已恢复原配置。"
     return 1
   fi
@@ -2098,12 +2325,14 @@ apply_candidate_state() {
   if [[ "$(jq '.nodes|length' "$STATE_FILE")" -eq 0 ]]; then
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
     systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    clear_apply_transaction
     prune_backups
     ok "状态已更新；当前没有节点，服务保持停止。"
     return 0
   fi
 
   if systemctl enable "$SERVICE_NAME" && systemctl restart "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; then
+    clear_apply_transaction
     prune_backups
     ok "服务端配置已通过检查并生效。"
     return 0
@@ -2122,6 +2351,7 @@ apply_candidate_state() {
   else
     systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
   fi
+  clear_apply_transaction
   return 1
 }
 
@@ -2474,7 +2704,6 @@ add_node_menu() {
   require_root
   require_core || return 1
   init_state || return 1
-  acquire_lock || return 1
   ensure_server_address || return 1
   printf '\n创建节点：\n'
   printf '  1. VLESS-Reality-Vision（TCP，无需证书）\n'
@@ -2780,7 +3009,6 @@ edit_node() {
   require_root
   require_core || return 1
   init_state || return 1
-  acquire_lock || return 1
   list_nodes
   [[ "$(jq '.nodes|length' "$STATE_FILE")" -gt 0 ]] || return 0
   id="$(select_node_id "选择要修改的节点编号")"
@@ -2877,7 +3105,6 @@ delete_node() {
   local id candidate argo_bound=0 rc
   require_root
   init_state || return 1
-  acquire_lock || return 1
   list_nodes
   [[ "$(jq '.nodes|length' "$STATE_FILE")" -gt 0 ]] || return 0
   id="$(select_node_id "选择要删除的节点编号")"
@@ -3088,8 +3315,44 @@ cloudflare_error_text() {
   jq -r '[.errors[]?.message, .messages[]?.message] | map(select(. != null and . != "")) | join("；") | if .=="" then "Cloudflare API 请求失败" else . end' "$1" 2>/dev/null || printf 'Cloudflare API 请求失败'
 }
 
+CF_TRANSACTION_TUNNEL_URL=""
+CF_TRANSACTION_ROLLBACK_PAYLOAD=""
+CF_TRANSACTION_ROLLBACK_RESPONSE=""
+CF_TRANSACTION_TEMP_DIR=""
+
+clear_cloudflare_transaction() {
+  trap - HUP INT TERM
+  CF_TRANSACTION_TUNNEL_URL=""
+  CF_TRANSACTION_ROLLBACK_PAYLOAD=""
+  CF_TRANSACTION_ROLLBACK_RESPONSE=""
+  CF_TRANSACTION_TEMP_DIR=""
+}
+
+interrupt_cloudflare_transaction() {
+  local code="$1"
+  trap - HUP INT TERM
+  cloudflare_api_request PUT "$CF_TRANSACTION_TUNNEL_URL" "$CF_TRANSACTION_ROLLBACK_PAYLOAD" "$CF_TRANSACTION_ROLLBACK_RESPONSE" || true
+  rm -rf -- "$CF_TRANSACTION_TEMP_DIR"
+  CF_API_TOKEN=""
+  release_lock
+  exit "$code"
+}
+
+arm_cloudflare_transaction() {
+  CF_TRANSACTION_TUNNEL_URL="$1"
+  CF_TRANSACTION_ROLLBACK_PAYLOAD="$2"
+  CF_TRANSACTION_ROLLBACK_RESPONSE="$3"
+  CF_TRANSACTION_TEMP_DIR="$4"
+  trap 'interrupt_cloudflare_transaction 129' HUP
+  trap 'interrupt_cloudflare_transaction 130' INT
+  trap 'interrupt_cloudflare_transaction 143' TERM
+}
+
 provision_named_tunnel() {
-  local hostname="$1" origin_port="$2" tunnel_token="$3" token_meta account_id tunnel_id zone_id temp_dir current_config config_payload config_response dns_response dns_payload dns_write_response record_count record_id record_type api_token
+  local hostname="$1" origin_port="$2" tunnel_token="$3" token_meta account_id tunnel_id zone_id temp_dir
+  local current_config config_payload config_response rollback_payload rollback_response
+  local dns_response dns_payload dns_write_response record_count record_id="" record_type="" api_token
+  local tunnel_url
   confirm_default_yes "是否由脚本自动配置 Public Hostname、Tunnel ingress 和 DNS？" || return 2
   token_meta="$(decode_tunnel_token "$tunnel_token")" || {
     error "无法从 Tunnel Token 读取 Account ID 和 Tunnel ID。"
@@ -3117,52 +3380,86 @@ provision_named_tunnel() {
   current_config="$temp_dir/current-config.json"
   config_payload="$temp_dir/config-payload.json"
   config_response="$temp_dir/config-response.json"
+  rollback_payload="$temp_dir/rollback-payload.json"
+  rollback_response="$temp_dir/rollback-response.json"
   dns_response="$temp_dir/dns-response.json"
   dns_payload="$temp_dir/dns-payload.json"
   dns_write_response="$temp_dir/dns-write-response.json"
+  tunnel_url="https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations"
 
-  info "正在读取并合并 Tunnel 现有 ingress，其他主机名不会被覆盖..."
-  if ! cloudflare_api_request GET "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations" "" "$current_config"; then
+  info "正在预检 Tunnel ingress 和目标 DNS 记录..."
+  if ! cloudflare_api_request GET "$tunnel_url" "" "$current_config"; then
     error "读取 Tunnel 配置失败：$(cloudflare_error_text "$current_config")"
     rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
   fi
-  jq --arg hostname "$hostname" --arg service "http://127.0.0.1:${origin_port}" '
-    (.result.config // {}) as $config |
-    ($config.ingress // []) as $ingress |
-    (($ingress | map(select((.hostname // "") == "" and (.service // "" | startswith("http_status:")))) | first) // {service:"http_status:404"}) as $catchall |
-    ($config | .ingress = (([$ingress[] | select((.hostname // "") != $hostname and (.hostname // "") != "")] + [{hostname:$hostname,service:$service},$catchall]))) |
-    {config:.}
-  ' "$current_config" > "$config_payload"
-  if ! cloudflare_api_request PUT "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations" "$config_payload" "$config_response"; then
-    error "更新 Tunnel ingress 失败：$(cloudflare_error_text "$config_response")"
-    rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
-  fi
-
-  info "正在创建或更新 ${hostname} 的 Tunnel DNS 记录..."
   if ! cloudflare_api_request GET "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=$(urlencode "$hostname")&per_page=100" "" "$dns_response"; then
     error "读取 DNS 记录失败：$(cloudflare_error_text "$dns_response")"
     rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
   fi
-  record_count="$(jq '.result|length' "$dns_response")"
-  jq -n --arg name "$hostname" --arg content "${tunnel_id}.cfargotunnel.com" '{type:"CNAME",name:$name,content:$content,proxied:true,ttl:1}' > "$dns_payload"
-  if (( record_count == 0 )); then
-    if ! cloudflare_api_request POST "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" "$dns_payload" "$dns_write_response"; then
-      error "创建 DNS 记录失败：$(cloudflare_error_text "$dns_write_response")"
-      rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
-    fi
-  else
+  record_count="$(jq -er '.result | length' "$dns_response")" || {
+    error "无法解析目标 DNS 记录。"
+    rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
+  }
+  if (( record_count > 1 )); then
+    error "${hostname} 存在多条同名 DNS 记录，拒绝自动选择或覆盖。"
+    rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
+  fi
+  if (( record_count == 1 )); then
     record_id="$(jq -r '.result[0].id' "$dns_response")"
     record_type="$(jq -r '.result[0].type' "$dns_response")"
     if [[ "$record_type" != "CNAME" ]]; then
       error "${hostname} 已存在 ${record_type} 记录，脚本不会破坏性转换记录类型。"
       rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
     fi
-    if ! cloudflare_api_request PUT "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" "$dns_payload" "$dns_write_response"; then
-      error "更新 DNS 记录失败：$(cloudflare_error_text "$dns_write_response")"
-      rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
-    fi
   fi
 
+  if ! jq '{config:(.result.config // {})}' "$current_config" > "$rollback_payload" ||
+     ! jq --arg hostname "$hostname" --arg service "http://127.0.0.1:${origin_port}" '
+       (.result.config // {}) as $config |
+       ($config.ingress // []) as $ingress |
+       ($ingress | to_entries |
+         map(select((.value.hostname // "") == "" and (.value.path // "") == "")) |
+         if length > 0 then .[-1].key else null end) as $catchall_index |
+       (if $catchall_index == null then {service:"http_status:404"} else $ingress[$catchall_index] end) as $catchall |
+       ($config | .ingress = (
+         ([$ingress | to_entries[] |
+           select(.key != ($catchall_index // -1)) |
+           .value |
+           select((.hostname // "") != $hostname)]) +
+         [{hostname:$hostname,service:$service},$catchall]
+       )) |
+       {config:.}
+     ' "$current_config" > "$config_payload" ||
+     ! jq -e '.config.ingress | type == "array" and length >= 2' "$config_payload" >/dev/null; then
+    error "生成 Tunnel ingress 候选配置失败，远端未修改。"
+    rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
+  fi
+
+  arm_cloudflare_transaction "$tunnel_url" "$rollback_payload" "$rollback_response" "$temp_dir"
+  if ! cloudflare_api_request PUT "$tunnel_url" "$config_payload" "$config_response"; then
+    clear_cloudflare_transaction
+    cloudflare_api_request PUT "$tunnel_url" "$rollback_payload" "$rollback_response" || warn "Tunnel ingress 更新结果不确定，且原配置恢复请求失败。"
+    error "更新 Tunnel ingress 失败：$(cloudflare_error_text "$config_response")"
+    rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
+  fi
+
+  info "正在创建或更新 ${hostname} 的 Tunnel DNS 记录..."
+  jq -n --arg name "$hostname" --arg content "${tunnel_id}.cfargotunnel.com" '{type:"CNAME",name:$name,content:$content,proxied:true,ttl:1}' > "$dns_payload"
+  if (( record_count == 0 )); then
+    if ! cloudflare_api_request POST "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" "$dns_payload" "$dns_write_response"; then
+      clear_cloudflare_transaction
+      cloudflare_api_request PUT "$tunnel_url" "$rollback_payload" "$rollback_response" || warn "DNS 创建失败，且 Tunnel ingress 自动恢复失败。"
+      error "创建 DNS 记录失败：$(cloudflare_error_text "$dns_write_response")"
+      rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
+    fi
+  elif ! cloudflare_api_request PUT "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" "$dns_payload" "$dns_write_response"; then
+    clear_cloudflare_transaction
+    cloudflare_api_request PUT "$tunnel_url" "$rollback_payload" "$rollback_response" || warn "DNS 更新失败，且 Tunnel ingress 自动恢复失败。"
+    error "更新 DNS 记录失败：$(cloudflare_error_text "$dns_write_response")"
+    rm -rf "$temp_dir"; CF_API_TOKEN=""; return 1
+  fi
+
+  clear_cloudflare_transaction
   rm -rf "$temp_dir"
   CF_API_TOKEN=""
   ARGO_TUNNEL_ID="$tunnel_id"
@@ -3201,7 +3498,7 @@ set_argo_status() {
   if ! jq --argjson provisioned "$provisioned" --argjson verified "$verified" --arg tunnel_id "$tunnel_id" '
     .argo.provisioned=$provisioned | .argo.verified=$verified |
     if $tunnel_id != "" then .argo.tunnel_id=$tunnel_id else . end
-  ' "$STATE_FILE" > "$candidate" || ! state_valid "$candidate" ||
+  ' "$STATE_FILE" > "$candidate" || ! state_candidate_valid "$candidate" ||
      ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
     rm -f -- "$candidate"
     return 1
@@ -3234,7 +3531,6 @@ configure_argo() {
   require_root
   require_core || return 1
   init_state || return 1
-  acquire_lock || return 1
   while IFS= read -r line; do vmess_ids+=("$line"); done < <(jq -r '.nodes[] | select(.type=="vmess") | .id' "$STATE_FILE")
   if (( ${#vmess_ids[@]} == 0 )); then
     error "请先创建一个 VMess-WebSocket-TLS 节点。"
@@ -3382,7 +3678,7 @@ disable_argo() {
 
 argo_menu() {
   local choice
-  init_state || return 1
+  with_lock init_state || return 1
   while true; do
     printf '\nArgo（仅 VMess-WebSocket）：\n'
     if jq -e '.argo.enabled' "$STATE_FILE" >/dev/null; then
@@ -3396,10 +3692,10 @@ argo_menu() {
     printf '  1. 配置 Argo\n  2. 刷新 Quick Tunnel 域名\n  3. 验证 Argo 公网 WebSocket\n  4. 停用 Argo\n  5. 查看 cloudflared 日志\n  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
-      1) configure_argo ;;
-      2) refresh_quick_argo ;;
-      3) verify_current_argo ;;
-      4) disable_argo ;;
+      1) with_lock configure_argo ;;
+      2) with_lock refresh_quick_argo ;;
+      3) with_lock verify_current_argo ;;
+      4) with_lock disable_argo ;;
       5) journalctl -u "$ARGO_SERVICE_NAME" -n 100 --no-pager ;;
       0) return 0 ;;
       *) error "无效选项。" ;;
@@ -3431,7 +3727,7 @@ save_firewall_mode() {
   candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
   if ! jq --arg mode "$mode" --argjson managed "$managed" \
       '.firewall_mode=$mode | .firewall_managed=$managed' "$STATE_FILE" > "$candidate" ||
-     ! state_valid "$candidate" || ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
+     ! state_candidate_valid "$candidate" || ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
     rm -f -- "$candidate"
     return 1
   fi
@@ -3568,25 +3864,41 @@ sync_firewall_if_managed() {
   sync_ufw_rules || fallback_to_permissive_firewall "自动同步 UFW 节点端口失败"
 }
 
+install_ufw_safely() {
+  local simulation removals
+  command -v apt-get >/dev/null 2>&1 || return 1
+  simulation="$(mktemp /tmp/mb-singbox-ufw-simulation.XXXXXX)" || return 1
+  if ! apt-get update || ! DEBIAN_FRONTEND=noninteractive apt-get -s install -y ufw > "$simulation"; then
+    rm -f -- "$simulation"
+    error "UFW 安装预演失败，未修改防火墙。"
+    return 1
+  fi
+  removals="$(awk '/^Remv / {print}' "$simulation")"
+  if [[ -n "$removals" ]]; then
+    warn "安装 UFW 将移除以下软件包："
+    printf '%s\n' "$removals"
+    confirm "确认接受上述软件包移除并继续安装 UFW？" || { rm -f -- "$simulation"; return 1; }
+  fi
+  rm -f -- "$simulation"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ufw
+}
+
 configure_ufw() {
   local ssh_port firewalld_was_active=0
   local -a ssh_ports=()
   if ! command -v ufw >/dev/null 2>&1; then
     confirm "系统没有 UFW，是否安装并进入节点端口收紧模式？" || return 0
-    if command -v apt-get >/dev/null 2>&1; then
-      apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ufw || return 1
-    else
-      error "当前系统无法自动安装 UFW；请继续使用宽松模式，或手动配置防火墙。"
+    if ! command -v apt-get >/dev/null 2>&1 || ! install_ufw_safely; then
+      error "UFW 未安装；防火墙状态保持不变。"
       return 1
     fi
   fi
 
   mapfile -t ssh_ports < <(detect_ssh_ports)
   if (( ${#ssh_ports[@]} == 0 )); then
-    read -r -p "无法自动识别 SSH 端口，请输入当前 SSH 端口（输入 0 取消）：" ssh_port
-    [[ "$ssh_port" == "0" ]] && return 0
-    validate_port "$ssh_port" || { error "SSH 端口格式不正确，已取消收紧。"; return 1; }
-    ssh_ports=("$ssh_port")
+    error "无法从当前 SSH 会话或 sshd 有效配置可靠识别 SSH 端口，拒绝启用默认拒绝入站。"
+    info "请先确认 SSH_CONNECTION 或 sshd -T 能返回当前监听端口，再重新进入收紧模式。"
+    return 1
   fi
 
   firewalld_is_active && firewalld_was_active=1
@@ -3680,10 +3992,29 @@ EOF
 }
 
 disable_bbr() {
+  local previous
   [[ -f "$BBR_FILE" ]] || { info "MB sing-box 管理器没有创建 BBR 配置。"; return 0; }
-  rm -f "$BBR_FILE"
-  sysctl --system >/dev/null || true
-  ok "已删除 MB sing-box 管理器的 BBR 配置，并重新加载系统原有 sysctl 配置。"
+  warn "将删除 ${BBR_FILE} 并重新加载系统全部 sysctl 配置。"
+  confirm "确认关闭 MB sing-box 管理器配置的 BBR？" || return 0
+  previous="$(mktemp /tmp/mb-singbox-bbr-disable.XXXXXX)" || return 1
+  if ! cp -a -- "$BBR_FILE" "$previous" || ! rm -f -- "$BBR_FILE"; then
+    rm -f -- "$previous"
+    error "无法备份或删除 BBR 配置。"
+    return 1
+  fi
+  if ! sysctl --system >/dev/null; then
+    if atomic_install_file "$previous" "$BBR_FILE" 0644; then
+      rm -f -- "$previous"
+    else
+      warn "BBR 配置自动恢复失败；临时备份保留在 ${previous}"
+    fi
+    sysctl --system >/dev/null 2>&1 || true
+    error "重新加载 sysctl 失败，已尝试恢复原 BBR 配置。"
+    return 1
+  fi
+  rm -f -- "$previous"
+  ok "已删除 MB sing-box 管理器的 BBR 配置，并成功重新加载系统 sysctl 配置。"
+  show_bbr_status
 }
 
 http_probe() {
@@ -3709,29 +4040,89 @@ check_ai_access() {
   printf '\n结果主要取决于 VPS 出口 IP、地区和信誉；本功能只诊断，不修改出口。\n'
 }
 
+CLIENT_TRANSACTION_BACKUP=""
+CLIENT_TRANSACTION_CANDIDATE=""
+
+clear_client_transaction() {
+  trap - HUP INT TERM
+  CLIENT_TRANSACTION_BACKUP=""
+  CLIENT_TRANSACTION_CANDIDATE=""
+}
+
+interrupt_client_transaction() {
+  local code="$1"
+  trap - HUP INT TERM
+  rm -f -- "$CLIENT_TRANSACTION_CANDIDATE"
+  if [[ -n "$CLIENT_TRANSACTION_BACKUP" && -d "$CLIENT_TRANSACTION_BACKUP" ]]; then
+    restore_backup "$CLIENT_TRANSACTION_BACKUP" || true
+  fi
+  release_lock
+  exit "$code"
+}
+
+arm_client_transaction() {
+  CLIENT_TRANSACTION_BACKUP="$1"
+  CLIENT_TRANSACTION_CANDIDATE="$2"
+  trap 'interrupt_client_transaction 129' HUP
+  trap 'interrupt_client_transaction 130' INT
+  trap 'interrupt_client_transaction 143' TERM
+}
+
 save_client_settings() {
-  local candidate="$1" success_message="${2:-客户端设置已保存。}"
-  state_valid "$candidate" || { error "客户端候选状态无效。"; return 1; }
+  local candidate="$1" success_message="${2:-客户端设置已保存。}" backup
+  state_candidate_valid "$candidate" || { error "客户端候选状态无效或跨字段不一致。"; return 1; }
+  backup="$(backup_current)" || return 1
+  arm_client_transaction "$backup" "$candidate"
   if [[ "$(jq '.nodes|length' "$candidate")" -gt 0 ]] && [[ -x "$SINGBOX_BIN" ]]; then
     if ! generate_outputs "$candidate"; then
+      clear_client_transaction
+      rm -rf -- "$backup"
       error "客户端设置未能生成有效配置，原状态保持不变。"
       return 1
     fi
   fi
   if ! atomic_install_file "$candidate" "$STATE_FILE" 0600; then
-    generate_outputs "$STATE_FILE" >/dev/null 2>&1 || true
-    error "客户端状态保存失败，原状态保持不变。"
+    restore_backup "$backup" || warn "客户端状态自动恢复不完整，请检查备份：${backup}"
+    clear_client_transaction
+    error "客户端状态保存失败，已恢复原状态。"
     return 1
   fi
+  clear_client_transaction
+  prune_backups
   ok "$success_message"
 }
 
+toggle_preferred_addresses() {
+  local candidate
+  candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
+  if ! write_jq_candidate "$candidate" '.client.preferred_enabled = ((.client.preferred_enabled != false) | not)' "$STATE_FILE" ||
+     ! save_client_settings "$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  rm -f -- "$candidate"
+}
+
+set_preferred_addresses() {
+  local addresses="$1" candidate
+  candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
+  if ! write_jq_candidate "$candidate" --argjson addresses "$addresses" '.client.preferred_addresses=$addresses | .client.preferred_results={} | .client.preferred_last_probe_at=""' "$STATE_FILE" ||
+     ! save_client_settings "$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  rm -f -- "$candidate"
+}
+
+reset_preferred_addresses() {
+  set_preferred_addresses '["cfip.1323123.xyz","cf.877771.xyz","cloudflare.182682.xyz","www.cloudflare.com","one.one.one.one"]'
+}
+
 client_settings_menu() {
-  local choice input candidate address addresses
+  local choice input address addresses
   local -a raw_addresses=() valid_addresses=()
   require_core || return 1
-  init_state || return 1
-  acquire_lock || return 1
+  with_lock init_state || return 1
   while true; do
     printf '\n客户端与 VMess/Argo 优选地址：\n'
     printf '状态：%s\n' "$(jq -r 'if (.client.preferred_enabled != false) then "已启用" else "已关闭" end' "$STATE_FILE")"
@@ -3751,14 +4142,7 @@ client_settings_menu() {
     read -r -p "请选择：" choice
     case "$choice" in
       1)
-        candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-        if ! write_jq_candidate "$candidate" '.client.preferred_enabled = ((.client.preferred_enabled != false) | not)' "$STATE_FILE" ||
-           ! save_client_settings "$candidate"; then
-          rm -f -- "$candidate"
-          pause
-          continue
-        fi
-        rm -f -- "$candidate"
+        with_lock toggle_preferred_addresses
         pause
         ;;
       2)
@@ -3780,29 +4164,15 @@ client_settings_menu() {
           continue
         fi
         addresses="$(jq -cn --args '$ARGS.positional' "${valid_addresses[@]}")"
-        candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-        if ! write_jq_candidate "$candidate" --argjson addresses "$addresses" '.client.preferred_addresses=$addresses | .client.preferred_results={} | .client.preferred_last_probe_at=""' "$STATE_FILE" ||
-           ! save_client_settings "$candidate"; then
-          rm -f -- "$candidate"
-          pause
-          continue
-        fi
-        rm -f -- "$candidate"
+        with_lock set_preferred_addresses "$addresses"
         pause
         ;;
       3)
-        candidate="$(mktemp "${ROOT_DIR}/.state.XXXXXX.json")" || return 1
-        if ! write_jq_candidate "$candidate" '.client.preferred_addresses=["cfip.1323123.xyz","cf.877771.xyz","cloudflare.182682.xyz","www.cloudflare.com","one.one.one.one"] | .client.preferred_results={} | .client.preferred_last_probe_at=""' "$STATE_FILE" ||
-           ! save_client_settings "$candidate"; then
-          rm -f -- "$candidate"
-          pause
-          continue
-        fi
-        rm -f -- "$candidate"
+        with_lock reset_preferred_addresses
         pause
         ;;
       4)
-        refresh_preferred_results
+        with_lock refresh_preferred_results
         pause
         ;;
       0) return 0 ;;
@@ -3825,16 +4195,16 @@ firewall_menu() {
     printf '  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
-      1) configure_permissive_firewall ;;
-      2) configure_ufw ;;
+      1) with_lock configure_permissive_firewall ;;
+      2) with_lock configure_ufw ;;
       3)
         if jq -e '.firewall_managed' "$STATE_FILE" >/dev/null 2>&1; then
-          sync_ufw_rules
+          with_lock sync_ufw_rules
         else
           error "当前不是节点端口收紧模式。"
         fi
         ;;
-      4) disable_ufw_management ;;
+      4) with_lock disable_ufw_management ;;
       0) return 0 ;;
       *) error "无效选项。" ;;
     esac
@@ -3851,8 +4221,8 @@ system_tools_menu() {
     printf '  1. 启用 BBR + fq\n  2. 关闭 MB sing-box 管理器配置的 BBR\n  3. 防火墙宽松/收紧设置\n  4. AI 服务可用性检测\n  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
-      1) enable_bbr ;;
-      2) disable_bbr ;;
+      1) with_lock enable_bbr ;;
+      2) with_lock disable_bbr ;;
       3) firewall_menu ;;
       4) check_ai_access ;;
       0) return 0 ;;
@@ -3866,7 +4236,6 @@ regenerate_all_configs() {
   local candidate candidate_config candidate_hopping runtime_unchanged=0
   require_core || return 1
   init_state || return 1
-  acquire_lock || return 1
   validate_state_certificates "$STATE_FILE" || return 1
   check_port_hopping_rules "$STATE_FILE" || return 1
 
@@ -3943,6 +4312,33 @@ show_current_service_errors() {
   fi
 }
 
+start_proxy_service() {
+  if check_configuration && systemctl enable --now "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; then
+    ok "${SERVICE_NAME} 已启动并设为开机自启。"
+  else
+    error "${SERVICE_NAME} 启动失败。"
+    return 1
+  fi
+}
+
+stop_proxy_service() {
+  if systemctl stop "$SERVICE_NAME"; then
+    ok "${SERVICE_NAME} 已停止。"
+  else
+    error "${SERVICE_NAME} 停止失败。"
+    return 1
+  fi
+}
+
+restart_proxy_service() {
+  if check_configuration && systemctl restart "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; then
+    ok "${SERVICE_NAME} 已重启并保持运行。"
+  else
+    error "${SERVICE_NAME} 重启失败。"
+    return 1
+  fi
+}
+
 service_menu() {
   local choice
   while true; do
@@ -3951,27 +4347,9 @@ service_menu() {
     printf '  1. 启动\n  2. 停止\n  3. 重启\n  4. 配置检查\n  5. 最近 50 行日志\n  6. 实时日志\n  7. 本次启动后的错误日志\n  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
-      1)
-        if check_configuration && systemctl enable --now "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; then
-          ok "${SERVICE_NAME} 已启动并设为开机自启。"
-        else
-          error "${SERVICE_NAME} 启动失败。"
-        fi
-        ;;
-      2)
-        if systemctl stop "$SERVICE_NAME"; then
-          ok "${SERVICE_NAME} 已停止。"
-        else
-          error "${SERVICE_NAME} 停止失败。"
-        fi
-        ;;
-      3)
-        if check_configuration && systemctl restart "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; then
-          ok "${SERVICE_NAME} 已重启并保持运行。"
-        else
-          error "${SERVICE_NAME} 重启失败。"
-        fi
-        ;;
+      1) with_lock start_proxy_service ;;
+      2) with_lock stop_proxy_service ;;
+      3) with_lock restart_proxy_service ;;
       4)
         if check_configuration; then
           ok "sing-box 服务端配置检查通过。"
@@ -4124,15 +4502,15 @@ maintenance_menu() {
     printf '  1. 安装/更新 sing-box 最新稳定版\n  2. 安装指定 sing-box 稳定版本\n  3. 更新 MB sing-box 管理器\n  4. 重新生成并应用全部配置\n  5. 运行安装诊断\n  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
-      1) install_or_update_core; pause ;;
+      1) with_lock install_or_update_core; pause ;;
       2)
         read -r -p "版本号（例如 1.13.14；输入 0 返回）：" version_input
         [[ "$version_input" == "0" ]] && continue
-        install_or_update_core "$version_input"
+        with_lock install_or_update_core "$version_input"
         pause
         ;;
       3)
-        if update_manager; then
+        if with_lock update_manager; then
           if (( MANAGER_UPDATE_APPLIED )); then
             info "按 Enter 键重新载入最新版菜单。"
             pause
@@ -4145,7 +4523,7 @@ maintenance_menu() {
         fi
         ;;
       4)
-        regenerate_all_configs
+        with_lock regenerate_all_configs
         pause
         ;;
       5) doctor; pause ;;
@@ -4240,7 +4618,11 @@ doctor() {
   printf '远端 %s@%s：%s（%s）\n' "$MANAGER_REPO" "$MANAGER_REF" "$remote_version" "$remote_source"
   printf 'sing-box 内核：%s\n' "$(current_core_version 2>/dev/null || printf '未安装')"
   if [[ -s "$STATE_FILE" ]] && state_valid "$STATE_FILE"; then
-    printf '状态文件：有效（%s）\n' "$STATE_FILE"
+    if state_consistent "$STATE_FILE"; then
+      printf '状态文件：有效且跨字段一致（%s）\n' "$STATE_FILE"
+    else
+      printf '状态文件：格式有效，但跨字段不一致（%s）\n' "$STATE_FILE"
+    fi
   else
     printf '状态文件：缺失或无效（%s）\n' "$STATE_FILE"
   fi
@@ -4264,6 +4646,17 @@ doctor() {
   type -a mb-singbox 2>/dev/null || true
 }
 
+prepare_main_menu() {
+  init_state || return 1
+  install_manager_binary || return 1
+}
+
+status_command() {
+  init_state || return 1
+  show_status_line
+  list_nodes
+}
+
 banner() {
   [[ -t 1 ]] && clear || true
   printf '%s%s' "$C_BOLD" "$C_CYAN"
@@ -4285,9 +4678,7 @@ main_menu() {
   require_root
   require_systemd || return 1
   install_dependencies || return 1
-  init_state || return 1
-  install_manager_binary || return 1
-  refresh_service_metadata || warn "systemd 服务描述自动迁移失败，可运行 doctor 检查。"
+  with_lock prepare_main_menu || return 1
   while true; do
     banner
     show_status_line
@@ -4307,16 +4698,16 @@ main_menu() {
     printf '\n'
     case "$choice" in
       1) maintenance_menu ;;
-      2) add_node_menu; pause ;;
+      2) with_lock add_node_menu; pause ;;
       3) view_node_menu; pause ;;
-      4) edit_node; pause ;;
-      5) delete_node; pause ;;
+      4) with_lock edit_node; pause ;;
+      5) with_lock delete_node; pause ;;
       6) service_menu ;;
       7) argo_menu ;;
       8) system_tools_menu ;;
-      9) ensure_server_address; generate_outputs "$STATE_FILE" || true; pause ;;
+      9) with_lock ensure_server_address; pause ;;
       10) client_settings_menu ;;
-      11) uninstall_all ;;
+      11) with_lock uninstall_all ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac
@@ -4350,13 +4741,13 @@ main() {
   local command="${1:-menu}"
   case "$command" in
     menu) main_menu ;;
-    install-core) require_root; shift; install_or_update_core "${1:-}" ;;
-    update-manager) update_manager ;;
+    install-core) require_root; shift; with_lock install_or_update_core "${1:-}" ;;
+    update-manager) with_lock update_manager ;;
     check) require_root; check_configuration ;;
-    render) require_root; regenerate_all_configs ;;
+    render) require_root; with_lock regenerate_all_configs ;;
     port-hopping-apply) require_root; apply_port_hopping_rules ;;
     port-hopping-clear) require_root; clear_port_hopping_rules ;;
-    status) require_root; init_state; show_status_line; list_nodes ;;
+    status) require_root; with_lock status_command ;;
     doctor) require_root; doctor ;;
     version|--version|-v) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     help|--help|-h) show_help ;;
