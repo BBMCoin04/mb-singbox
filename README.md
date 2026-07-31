@@ -1,6 +1,6 @@
 # MB sing-box 管理器
 
-面向 Linux VPS 的 sing-box 节点管理脚本，当前版本：`0.7.3`。
+面向 Linux VPS 的 sing-box 节点管理脚本，当前版本：`0.7.4`。
 
 它通过菜单完成内核安装、节点管理、客户端配置、服务日志、防火墙、BBR、Hysteria2 端口跳跃和 Cloudflare Tunnel 管理。主命令是 `mb-singbox`，旧命令 `singbox` 仅用于兼容。
 
