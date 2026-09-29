@@ -6,7 +6,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.7.5"
+VERSION="0.7.6"
 PROGRAM="mb-singbox"
 MANAGER_UPDATE_APPLIED=0
 INSTALL_PATH="${MB_SINGBOX_INSTALL_PATH:-/usr/local/sbin/mb-singbox}"
@@ -1719,12 +1719,13 @@ render_client_config() {
         strategy: "prefer_ipv4",
         reverse_mapping: true
       },
+      # 1.15+ uses the new sing-tun stack; 1.14 selects a supported default.
       inbounds: [
         {
           type: "tun", tag: "tun-in",
           address: ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
           auto_route: true, strict_route: true,
-          stack: "mixed", dns_mode: "hijack"
+          dns_mode: "hijack"
         }
       ],
       outbounds: ($p + [
